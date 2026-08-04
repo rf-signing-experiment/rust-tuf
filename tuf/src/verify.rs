@@ -1,7 +1,6 @@
 //! The `verify` module performs signature verification.
 
 use log::{debug, warn};
-use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::crypto::{KeyId, PublicKey, Signature};
@@ -102,19 +101,9 @@ where
         .map(|k| (k.key_id(), k))
         .collect::<HashMap<&KeyId, &PublicKey>>();
 
-    // Extract the signatures and canonicalize the bytes.
-    let (signatures, canonical_bytes) = {
-        #[derive(Deserialize)]
-        pub struct SignedMetadata<D: Pouf> {
-            signatures: Vec<Signature>,
-            signed: D::RawData,
-        }
-
-        let unverified: SignedMetadata<D> = D::from_slice(raw_metadata.as_bytes())?;
-
-        let canonical_bytes = D::canonicalize(&unverified.signed)?;
-        (unverified.signatures, canonical_bytes)
-    };
+    // Extract the signatures and the byte string the signatures are computed over.
+    let (signatures, signed) = D::deserialize_signed(raw_metadata.as_bytes())?;
+    let signing_input = D::signing_input(&signed)?;
 
     let mut signatures_needed = threshold;
 
@@ -126,7 +115,7 @@ where
 
     for (key_id, sig) in signatures {
         match authorized_keys.get(key_id) {
-            Some(pub_key) => match pub_key.verify(role, &canonical_bytes, sig) {
+            Some(pub_key) => match pub_key.verify(role, &signing_input, sig) {
                 Ok(()) => {
                     debug!("Good signature from key ID {:?}", pub_key.key_id());
                     signatures_needed -= 1;
@@ -156,12 +145,7 @@ where
     }
 
     // Everything looks good so deserialize the metadata.
-    //
-    // Note: Canonicalization (or any other transformation of data) could modify or filter out
-    // information about the data. Therefore, while we've confirmed the canonical bytes are signed,
-    // we shouldn't interpret this as if the raw bytes were signed. So we deserialize from the
-    // `canonical_bytes`, rather than from `raw_meta.as_bytes()`.
-    let verified_metadata = D::from_slice(&canonical_bytes)?;
+    let verified_metadata = D::from_raw_data(&signed)?;
 
     Ok(Verified::new(verified_metadata))
 }

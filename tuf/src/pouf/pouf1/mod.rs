@@ -3,8 +3,9 @@ use serde::ser::Serialize;
 use std::collections::BTreeMap;
 
 use crate::Result;
+use crate::crypto::Signature;
 use crate::error::Error;
-use crate::pouf::Pouf;
+use crate::pouf::{Pouf, SignedDocument, SignedDocumentOwned};
 
 pub(crate) mod shims;
 
@@ -191,13 +192,11 @@ impl Pouf for Pouf1 {
 
     /// ```
     /// # use tuf::pouf::{Pouf, Pouf1};
-    /// # use std::collections::HashMap;
-    /// let jsn: &[u8] = br#"{"foo": "bar", "baz": "quux"}"#;
-    /// let raw = Pouf1::from_slice(jsn).unwrap();
-    /// let out = Pouf1::canonicalize(&raw).unwrap();
+    /// let raw = serde_json::json!({"foo": "bar", "baz": "quux"});
+    /// let out = Pouf1::signing_input(&raw).unwrap();
     /// assert_eq!(out, br#"{"baz":"quux","foo":"bar"}"#);
     /// ```
-    fn canonicalize(raw_data: &Self::RawData) -> Result<Vec<u8>> {
+    fn signing_input(raw_data: &Self::RawData) -> Result<Vec<u8>> {
         canonicalize(raw_data).map_err(Error::Opaque)
     }
 
@@ -215,10 +214,10 @@ impl Pouf for Pouf1 {
     ///
     /// let jsn = json!({"foo": "wat", "bar": "lol"});
     /// let thing = Thing { foo: "wat".into(), bar: "lol".into() };
-    /// let de: Thing = Pouf1::deserialize(&jsn).unwrap();
+    /// let de: Thing = Pouf1::from_raw_data(&jsn).unwrap();
     /// assert_eq!(de, thing);
     /// ```
-    fn deserialize<T>(raw_data: &Self::RawData) -> Result<T>
+    fn from_raw_data<T>(raw_data: &Self::RawData) -> Result<T>
     where
         T: DeserializeOwned,
     {
@@ -239,27 +238,42 @@ impl Pouf for Pouf1 {
     ///
     /// let jsn = json!({"foo": "wat", "bar": "lol"});
     /// let thing = Thing { foo: "wat".into(), bar: "lol".into() };
-    /// let se: serde_json::Value = Pouf1::serialize(&thing).unwrap();
+    /// let se: serde_json::Value = Pouf1::to_raw_data(&thing).unwrap();
     /// assert_eq!(se, jsn);
     /// ```
-    fn serialize<T>(data: &T) -> Result<Self::RawData>
+    fn to_raw_data<T>(data: &T) -> Result<Self::RawData>
     where
         T: Serialize,
     {
         Ok(serde_json::to_value(data)?)
     }
 
+    /// Write out ordinary JSON, with the object keys in sorted order.
+    ///
+    /// This is deliberately not the canonical JSON that [`signing_input`](Pouf1::signing_input)
+    /// produces. Canonical JSON escapes only `"` and `\`, so a string holding a control
+    /// character - the newlines in a PEM encoded public key, say - comes out as something no JSON
+    /// parser will read back. The two encodings agree on every string that has none.
+    ///
     /// ```
+    /// # use serde_json::json;
     /// # use tuf::pouf::{Pouf, Pouf1};
-    /// # use std::collections::HashMap;
-    /// let jsn: &[u8] = br#"{"foo": "bar", "baz": "quux"}"#;
-    /// let _: HashMap<String, String> = Pouf1::from_slice(&jsn).unwrap();
+    /// let jsn = json!({"foo": "bar", "baz": "a\nb"});
+    ///
+    /// assert_eq!(Pouf1::serialize_signed(&[], &jsn).unwrap(), br#"{"signatures":[],"signed":{"baz":"a\nb","foo":"bar"}}"#);
+    /// assert_eq!(Pouf1::signing_input(&jsn).unwrap(), b"{\"baz\":\"a\nb\",\"foo\":\"bar\"}");
     /// ```
-    fn from_slice<T>(slice: &[u8]) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        Ok(serde_json::from_slice(slice)?)
+    fn serialize_signed(signatures: &[Signature], raw_data: &Self::RawData) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&SignedDocument {
+            signatures,
+            signed: raw_data,
+        })?)
+    }
+
+    fn deserialize_signed(slice: &[u8]) -> Result<(Vec<Signature>, Self::RawData)> {
+        let document: SignedDocumentOwned<Self::RawData> = serde_json::from_slice(slice)?;
+
+        Ok((document.signatures, document.signed))
     }
 }
 

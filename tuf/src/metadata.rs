@@ -278,7 +278,13 @@ where
     /// **WARNING**: This does not verify signatures, so it exposes users to potential parser
     /// exploits.
     pub fn parse_untrusted(&self) -> Result<SignedMetadata<D, M>> {
-        D::from_slice(&self.bytes)
+        let (signatures, metadata) = D::deserialize_signed(&self.bytes)?;
+
+        Ok(SignedMetadata {
+            signatures,
+            metadata,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -388,15 +394,15 @@ where
 {
     /// Create a new `SignedMetadataBuilder` from a given `Metadata`.
     pub fn from_metadata(metadata: &M) -> Result<Self> {
-        let metadata = D::serialize(metadata)?;
+        let metadata = D::to_raw_data(metadata)?;
         Self::from_raw_metadata(metadata)
     }
 
     /// Create a new `SignedMetadataBuilder` from manually serialized metadata to be signed.
     /// Returns an error if `metadata` cannot be parsed into `M`.
     pub fn from_raw_metadata(metadata: D::RawData) -> Result<Self> {
-        let _ensure_metadata_parses: M = D::deserialize(&metadata)?;
-        let metadata_bytes = D::canonicalize(&metadata)?;
+        let _ensure_metadata_parses: M = D::from_raw_data(&metadata)?;
+        let metadata_bytes = D::signing_input(&metadata)?;
         Ok(Self {
             signatures: HashMap::new(),
             metadata,
@@ -450,8 +456,8 @@ where
     D: Pouf,
     M: Metadata,
 {
-    /// Create a new `SignedMetadata`. The supplied private key is used to sign the canonicalized
-    /// bytes of the provided metadata with the provided scheme.
+    /// Create a new `SignedMetadata`. The supplied private key is used to sign the [signing
+    /// input](crate::pouf::Pouf::signing_input) of the provided metadata.
     ///
     /// ```
     /// # use chrono::prelude::*;
@@ -466,8 +472,8 @@ where
     /// SignedMetadata::<Pouf1, _>::new(&snapshot, &key).unwrap();
     /// ```
     pub fn new(metadata: &M, private_key: &dyn PrivateKey) -> Result<Self> {
-        let raw = D::serialize(metadata)?;
-        let bytes = D::canonicalize(&raw)?;
+        let raw = D::to_raw_data(metadata)?;
+        let bytes = D::signing_input(&raw)?;
         let sig = private_key.sign(&bytes)?;
         Ok(Self {
             signatures: vec![sig],
@@ -489,7 +495,7 @@ where
     ///   signature. Metadata obtained from a remote source may have included different whitespace
     ///   or ordered fields in a way that is not preserved when parsing that metadata.
     pub fn to_raw(&self) -> Result<RawSignedMetadata<D, M>> {
-        let bytes = D::canonicalize(&D::serialize(self)?)?;
+        let bytes = D::serialize_signed(&self.signatures, &self.metadata)?;
         Ok(RawSignedMetadata::new(bytes))
     }
 
@@ -525,7 +531,7 @@ where
     /// assert_eq!(snapshot.signatures().len(), 2);
     /// ```
     pub fn add_signature(&mut self, private_key: &dyn PrivateKey) -> Result<()> {
-        let bytes = D::canonicalize(&self.metadata)?;
+        let bytes = D::signing_input(&self.metadata)?;
         let sig = private_key.sign(&bytes)?;
         self.signatures
             .retain(|s| s.key_id() != private_key.public().key_id());
@@ -578,7 +584,7 @@ where
             version: u32,
         }
 
-        let meta: MetadataVersion = D::deserialize(&self.metadata)?;
+        let meta: MetadataVersion = D::from_raw_data(&self.metadata)?;
         Ok(meta.version)
     }
 
@@ -586,7 +592,7 @@ where
     ///
     /// This operation is not safe to do with metadata obtained from an untrusted source.
     pub fn assume_valid(&self) -> Result<M> {
-        D::deserialize(&self.metadata)
+        D::from_raw_data(&self.metadata)
     }
 }
 
@@ -2705,7 +2711,7 @@ mod test {
     #[test]
     fn de_ser_root_metadata_wrong_key_id() {
         let jsn = jsn_root_metadata_without_keyid_hash_algos();
-        let mut jsn_str = str::from_utf8(&Pouf1::canonicalize(&jsn).unwrap())
+        let mut jsn_str = str::from_utf8(&Pouf1::signing_input(&jsn).unwrap())
             .unwrap()
             .to_owned();
         // Replace the key id to something else.
