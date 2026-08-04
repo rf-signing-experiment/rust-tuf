@@ -20,6 +20,7 @@ path = "./src/lib.rs"
 [dependencies]
 chrono = { version = "0.4.42", features = [ "serde" ] }
 data-encoding = "2.10"
+dsse = { path = "../dsse", version = "0.1.0" }
 futures-io = "0.3.31"
 futures-util = { version = "0.3.31", features = [ "io" ] }
 http = "1"
