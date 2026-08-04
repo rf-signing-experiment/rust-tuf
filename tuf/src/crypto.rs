@@ -220,7 +220,7 @@ fn calculate_key_id(
         keyid_hash_algorithms,
         public_key,
     )?;
-    let public_key = Pouf1::canonicalize(&Pouf1::serialize(&public_key)?)?;
+    let public_key = Pouf1::signing_input(&Pouf1::to_raw_data(&public_key)?)?;
     let mut context = digest::Context::new(&SHA256);
     context.update(&public_key);
 

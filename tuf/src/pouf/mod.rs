@@ -7,30 +7,71 @@ use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
 use crate::Result;
+use crate::crypto::Signature;
+
+/// The `{"signatures": ..., "signed": ...}` document that the JSON poufs write.
+#[derive(serde::Serialize)]
+pub struct SignedDocument<'a, R: Serialize> {
+    /// The signatures over the signing input of `signed`.
+    pub signatures: &'a [Signature],
+
+    /// The signed portion of the metadata.
+    pub signed: &'a R,
+}
+
+/// The `{"signatures": ..., "signed": ...}` document that the JSON poufs read.
+#[derive(serde::Deserialize)]
+pub struct SignedDocumentOwned<R> {
+    /// The signatures over the signing input of `signed`.
+    pub signatures: Vec<Signature>,
+
+    /// The signed portion of the metadata.
+    pub signed: R,
+}
 
 /// The format used for data interchange, serialization, and deserialization.
-pub trait Pouf: Sync {
+///
+/// A Pouf answers three separate questions:
+///
+/// * How the signed portion is read and written ([`RawData`]
+/// * How the signed portion is converted to bytes for signing ([`signing_input`])
+/// * How the whole document (data + signatures) is read and written ([`serialize_signed`] and
+///   [`deserialize_signed`]).
+///
+/// [`RawData`]: Pouf::RawData
+/// [`signing_input`]: Pouf::signing_input
+/// [`serialize_signed`]: Pouf::serialize_signed
+/// [`deserialize_signed`]: Pouf::deserialize_signed
+pub trait Pouf: Sized + Sync {
     /// The type of data that is contained in the `signed` portion of metadata.
-    type RawData: Serialize + DeserializeOwned + PartialEq;
+    type RawData: PartialEq;
 
     /// The data pouf's extension.
     fn extension() -> &'static str;
 
-    /// A function that canonicalizes data to allow for deterministic signatures.
-    fn canonicalize(raw_data: &Self::RawData) -> Result<Vec<u8>>;
+    /// Turns the signed portion of metadata into the byte string that signatures
+    /// are computed over. Must be deterministic.
+    fn signing_input(raw_data: &Self::RawData) -> Result<Vec<u8>>;
 
-    /// Deserialize from `RawData`.
-    fn deserialize<T>(raw_data: &Self::RawData) -> Result<T>
-    where
-        T: DeserializeOwned;
-
-    /// Serialize into `RawData`.
-    fn serialize<T>(data: &T) -> Result<Self::RawData>
+    /// Convert metadata to the signed portion of a document.
+    fn to_raw_data<T>(data: &T) -> Result<Self::RawData>
     where
         T: Serialize;
 
-    /// Read a struct from a stream.
-    fn from_slice<T>(slice: &[u8]) -> Result<T>
+    /// Read metadata from the signed portion of a document.
+    fn from_raw_data<T>(raw_data: &Self::RawData) -> Result<T>
     where
         T: DeserializeOwned;
+
+    /// Write signed metadata out in the pouf's wire format.
+    ///
+    /// This is the format metadata is stored and transported in. It includes both the raw data
+    /// and the signatures over it.
+    fn serialize_signed(signatures: &[Signature], raw_data: &Self::RawData) -> Result<Vec<u8>>;
+
+    /// Read signed metadata from the pouf's wire format, returning the signatures and the signed
+    /// portion of the metadata.
+    ///
+    /// **WARNING**: This does not verify the signatures.
+    fn deserialize_signed(slice: &[u8]) -> Result<(Vec<Signature>, Self::RawData)>;
 }
