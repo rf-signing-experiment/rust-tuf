@@ -1,8 +1,10 @@
 //! Structures and functions to aid in various TUF data pouf formats.
 
 pub(crate) mod pouf1;
+pub(crate) mod pouf2;
 pub(crate) mod shims;
 pub use pouf1::Pouf1;
+pub use pouf2::{PAYLOAD_TYPE, Payload, Pouf2};
 
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
