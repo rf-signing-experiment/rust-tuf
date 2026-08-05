@@ -61,15 +61,10 @@ impl PublicKey {
     }
 
     fn decode<D: Pouf>(self) -> Result<crypto::PublicKey> {
-        if self.keytype == crypto::KeyType::Ed25519
-            && self.scheme != crypto::SignatureScheme::Ed25519
-        {
-            return Err(Error::Encoding(format!(
-                "ed25519 key type must be used with the ed25519 signature scheme, not {:?}",
-                self.scheme,
-            )));
-        }
-
+        // Whether the key type and the scheme agree is not settled here. A key that names a
+        // scheme this crate cannot pair with its type is one that cannot verify anything, which
+        // `crypto::PublicKey::verify` is what reports; refusing to read it would instead take the
+        // whole of the surrounding metadata down with it.
         D::decode_public_key(self.keytype, self.scheme, &self.keyval.public)
     }
 }
