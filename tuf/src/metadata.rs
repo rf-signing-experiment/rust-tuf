@@ -2314,7 +2314,7 @@ impl DelegationBuilder {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::crypto::Ed25519PrivateKey;
+    use crate::crypto::{EcdsaPrivateKey, Ed25519PrivateKey, RsaPrivateKey};
     use crate::pouf::Pouf1;
     use crate::verify::verify_signatures;
     use assert_matches::assert_matches;
@@ -2329,6 +2329,8 @@ mod test {
     const ED25519_2_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-2.pk8.der");
     const ED25519_3_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-3.pk8.der");
     const ED25519_4_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-4.pk8.der");
+    const ECDSA_P256_1_PK8: &[u8] = include_bytes!("../tests/ecdsa/ecdsa-p256-1.pk8.der");
+    const RSA_1_PK8: &[u8] = include_bytes!("../tests/rsa/rsa-2048-1.pk8.der");
 
     #[test]
     fn no_pardir_in_target_path() {
@@ -2744,10 +2746,10 @@ mod test {
                     },
                 },
                 "0000000000000000000000000000000000000000000000000000000000000000": {
-                    "keytype": "ecdsa-sha2-nistp256",
-                    "scheme": "ecdsa-sha2-nistp256",
+                    "keytype": "ed448",
+                    "scheme": "ed448",
                     "keyval": {
-                        "public": "04cbc5cab2684160323c25cd06c3307178a6b1d1c9b949328453ae473c5ba7527e35b13f298b41633382241f3fd8526c262d43b45adee5c618fa0642c82b8a9803",
+                        "public": "-----BEGIN PUBLIC KEY-----\nc29tZSBrZXkgdGhpcyBjcmF0ZSBjYW5ub3QgdXNl\n-----END PUBLIC KEY-----\n",
                     },
                 },
             },
@@ -2763,6 +2765,177 @@ mod test {
         assert_eq!(decoded.keys.len(), 2);
 
         // ... and it survives a round trip untouched.
+        assert_eq!(decoded.to_raw_data::<Pouf1>().unwrap(), root);
+    }
+
+    /// A repository may hold a key of a type this crate supports that signs with a scheme it does
+    /// not, such as an RSA key using `rsassa-pss-sha512`. The key type says how the key material
+    /// is written, so such a key still reads and round trips; it is just a key that cannot verify
+    /// anything.
+    #[test]
+    fn keys_with_unsupported_schemes_do_not_break_parsing() {
+        let rsa_key =
+            RsaPrivateKey::from_pkcs8(RSA_1_PK8, crypto::SignatureScheme::RsassaPssSha256).unwrap();
+        let pem = rsa_key.public().to_pem().unwrap();
+
+        let root = json!({
+            "_type": "root",
+            "spec_version": "1.0.0",
+            "version": 1,
+            "expires": "2017-01-01T00:00:00Z",
+            "consistent_snapshot": false,
+            "keys": {
+                "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f": {
+                    "keytype": "ed25519",
+                    "scheme": "ed25519",
+                    "keyval": {
+                        "public": "eb8ac26b5c9ef0279e3be3e82262a93bce16fe58ee422500d38caf461c65a3b6",
+                    },
+                },
+                "0000000000000000000000000000000000000000000000000000000000000000": {
+                    "keytype": "rsa",
+                    "scheme": "rsassa-pss-sha512",
+                    "keyval": { "public": pem },
+                },
+            },
+            "roles": {
+                "root": { "threshold": 1, "keyids": ["061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f"] },
+                "snapshot": { "threshold": 1, "keyids": ["061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f"] },
+                "targets": { "threshold": 1, "keyids": ["061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f"] },
+                "timestamp": { "threshold": 1, "keyids": ["0000000000000000000000000000000000000000000000000000000000000000"] },
+            },
+        });
+
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&root).unwrap();
+        assert_eq!(decoded.keys.len(), 2);
+
+        let key_id =
+            KeyId::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+        let key = decoded.keys.get(&key_id).unwrap();
+        assert_eq!(key.typ(), &crypto::KeyType::Rsa);
+        assert_eq!(key.as_bytes(), rsa_key.public().as_bytes());
+
+        // It cannot verify anything, though.
+        assert_matches!(
+            key.verify(&MetadataPath::timestamp(), b"test", &rsa_key.sign(b"test").unwrap()),
+            Err(Error::UnknownSignatureScheme(s)) if s == "rsassa-pss-sha512"
+        );
+
+        // ... and it survives a round trip untouched.
+        assert_eq!(decoded.to_raw_data::<Pouf1>().unwrap(), root);
+    }
+
+    /// POUF-1 writes an ECDSA key the way the rest of the TUF ecosystem does: as a PEM encoded
+    /// `SubjectPublicKeyInfo` under the modern `ecdsa` key type.
+    #[test]
+    fn ecdsa_keys_are_written_as_pem() {
+        let key = EcdsaPrivateKey::from_pkcs8(
+            ECDSA_P256_1_PK8,
+            crypto::SignatureScheme::EcdsaSha2NistP256,
+        )
+        .unwrap();
+
+        let root = RootMetadataBuilder::new()
+            .expires(Utc.with_ymd_and_hms(2038, 1, 1, 0, 0, 0).unwrap())
+            .root_key(key.public().clone())
+            .snapshot_key(key.public().clone())
+            .targets_key(key.public().clone())
+            .timestamp_key(key.public().clone())
+            .build()
+            .unwrap();
+
+        let raw = root.to_raw_data::<Pouf1>().unwrap();
+        let written = &raw["keys"][key.public().key_id().to_string()];
+
+        assert_eq!(written["keytype"], json!("ecdsa"));
+        assert_eq!(written["scheme"], json!("ecdsa-sha2-nistp256"));
+        assert_eq!(
+            written["keyval"]["public"],
+            json!(key.public().to_pem().unwrap()),
+        );
+
+        // ... and reading it back gives the same key, which can still check a signature.
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&raw).unwrap();
+        assert_eq!(decoded, root);
+
+        let signed: SignedMetadata<Pouf1, _> = SignedMetadata::new(&decoded, &key).unwrap();
+        assert_matches!(
+            verify_signatures(
+                &MetadataPath::root(),
+                &signed.to_raw().unwrap(),
+                1,
+                &[key.public().clone()],
+            ),
+            Ok(_)
+        );
+    }
+
+    /// A key on an ECDSA curve this crate does not implement is kept as it was written rather
+    /// than making the metadata that carries it unreadable. The same goes for a key that is
+    /// simply malformed.
+    #[test]
+    fn keys_this_crate_cannot_interpret_do_not_break_parsing() {
+        // A P-384 key. Its type and scheme are both spelled the way the TUF spec says, and its
+        // encoding is correct; this crate just only implements P-256.
+        let p384 = "-----BEGIN PUBLIC KEY-----\n\
+                    MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEOJxHyrWkb+X+nHBpBedoURlJzzJAqD7H\n\
+                    Al5EnE/o4CEBmvSafW5to8HZfcwMaqjKBslJ3t6LaTupO7wDEo5Fm9kzIQVYzC7/\n\
+                    bW8b/msqUrEDDUR5z+IP7VILgUrouOCV\n\
+                    -----END PUBLIC KEY-----\n";
+
+        // ... and an `ecdsa` key that is not written the way this crate writes one at all.
+        let malformed = "04cbc5cab2684160323c25cd06c3307178a6b1d1c9b949328453ae473c5ba752\
+                         7e35b13f298b41633382241f3fd8526c262d43b45adee5c618fa0642c82b8a9803";
+
+        let root = json!({
+            "_type": "root",
+            "spec_version": "1.0.0",
+            "version": 1,
+            "expires": "2017-01-01T00:00:00Z",
+            "consistent_snapshot": false,
+            "keys": {
+                "0000000000000000000000000000000000000000000000000000000000000000": {
+                    "keytype": "ecdsa",
+                    "scheme": "ecdsa-sha2-nistp384",
+                    "keyval": { "public": p384 },
+                },
+                "1111111111111111111111111111111111111111111111111111111111111111": {
+                    "keytype": "ecdsa",
+                    "scheme": "ecdsa-sha2-nistp256",
+                    "keyval": { "public": malformed },
+                },
+            },
+            "roles": {
+                "root": { "threshold": 1, "keyids": ["0000000000000000000000000000000000000000000000000000000000000000"] },
+                "snapshot": { "threshold": 1, "keyids": ["0000000000000000000000000000000000000000000000000000000000000000"] },
+                "targets": { "threshold": 1, "keyids": ["0000000000000000000000000000000000000000000000000000000000000000"] },
+                "timestamp": { "threshold": 1, "keyids": ["1111111111111111111111111111111111111111111111111111111111111111"] },
+            },
+        });
+
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&root).unwrap();
+        assert_eq!(decoded.keys.len(), 2);
+
+        for key in decoded.keys.values() {
+            assert!(key.is_opaque());
+            assert_eq!(key.typ(), &crypto::KeyType::Ecdsa);
+
+            // Neither can be used to check anything.
+            assert_matches!(
+                key.verify(
+                    &MetadataPath::root(),
+                    b"test",
+                    &crypto::Signature::new(
+                        key.key_id().clone(),
+                        crypto::SignatureValue::new(b"sig".to_vec()),
+                    )
+                ),
+                Err(Error::UnknownKeyType(_))
+            );
+        }
+
+        // ... and both survive a round trip untouched.
         assert_eq!(decoded.to_raw_data::<Pouf1>().unwrap(), root);
     }
 
