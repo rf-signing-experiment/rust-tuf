@@ -7,7 +7,9 @@ use data_encoding::HEXLOWER;
 use crate::Result;
 use crate::crypto::{KeyType, PublicKey, Signature, SignatureScheme};
 use crate::error::Error;
-use crate::pouf::{Pouf, SignedDocument, SignedDocumentOwned};
+use crate::pouf::{
+    Pouf, SignedDocument, SignedDocumentOwned, fall_back_to_opaque, opaque_key, opaque_public_key,
+};
 
 /// TUF POUF-1 implementation.
 ///
@@ -19,7 +21,7 @@ use crate::pouf::{Pouf, SignedDocument, SignedDocumentOwned};
 ///
 /// `EXPIRES` is an ISO-8601 date time in format `YYYY-MM-DD'T'hh:mm:ss'Z'`.
 ///
-/// `KEY_ID` is the hex encoded value of `sha256(cjson(pub_key))`.
+/// `KEY_ID` is an opaque identifier that names a key within the metadata.
 ///
 /// `PUB_KEY` is the following:
 ///
@@ -31,11 +33,13 @@ use crate::pouf::{Pouf, SignedDocument, SignedDocumentOwned};
 /// }
 /// ```
 ///
-/// `PUBLIC` is a base64url encoded `SubjectPublicKeyInfo` DER public key.
+/// `PUBLIC` is the public key. An `ed25519` key is written as the hex encoding of its raw bytes;
+/// every other key type is written as a PEM encoded `SubjectPublicKeyInfo`.
 ///
-/// `KEY_TYPE` is a string (`ed25519` is the only one currently supported).
+/// `KEY_TYPE` is a string (`ed25519`, `ecdsa`, and `rsa` are currently supported).
 ///
-/// `SCHEME` is a string (`ed25519` is the only one currently supported).
+/// `SCHEME` is a string (`ed25519`, `ecdsa-sha2-nistp256`, and `rsassa-pss-sha256` are currently
+/// supported).
 ///
 /// `HASH_VALUE` is a hex encoded hash value.
 ///
@@ -276,21 +280,20 @@ impl Pouf for Pouf1 {
         Ok((document.signatures, document.signed))
     }
 
-    /// Write an ed25519 key as its hex encoded raw bytes.
+    /// Write an ed25519 key as hex bytes, other keys as PEM.
     fn encode_public_key(public_key: &PublicKey) -> Result<String> {
+        // A key this crate never made sense of is handed back exactly as it was read, because
+        // there is nothing else it could honestly be written as.
+        if public_key.is_opaque() {
+            return opaque_public_key(public_key);
+        }
+
         match public_key.typ() {
             KeyType::Ed25519 => Ok(HEXLOWER.encode(public_key.as_bytes())),
-            // This crate has no idea how a key type it does not understand is spelled, so the
-            // value is handed back exactly as it was read.
-            KeyType::Unknown(_) => std::str::from_utf8(public_key.as_bytes())
-                .map(|public| public.to_string())
-                .map_err(|err| {
-                    Error::Encoding(format!(
-                        "public key of unknown key type {} is not a string: {}",
-                        public_key.typ(),
-                        err,
-                    ))
-                }),
+            // Every other TUF implementation spells an ECDSA or RSA key as a PEM encoded
+            // `SubjectPublicKeyInfo`, so this one does too.
+            KeyType::Ecdsa | KeyType::Rsa => public_key.to_pem(),
+            KeyType::Unknown(_) => opaque_public_key(public_key),
         }
     }
 
@@ -299,18 +302,22 @@ impl Pouf for Pouf1 {
         scheme: SignatureScheme,
         public: &str,
     ) -> Result<PublicKey> {
-        match key_type {
-            KeyType::Ed25519 => {
-                let bytes = HEXLOWER.decode(public.as_bytes()).map_err(|err| {
+        let decoded = match key_type {
+            KeyType::Ed25519 => HEXLOWER
+                .decode(public.as_bytes())
+                .map_err(|err| {
                     Error::Encoding(format!("could not parse public key as hex: {}", err))
-                })?;
-
-                PublicKey::new(key_type, scheme, bytes)
+                })
+                .and_then(|bytes| PublicKey::new(key_type.clone(), scheme.clone(), bytes)),
+            KeyType::Ecdsa | KeyType::Rsa => {
+                PublicKey::from_pem(public, key_type.clone(), scheme.clone())
             }
-            // Keep it as it was written, so that metadata carrying key types this crate cannot
-            // use is still readable, and still round trips.
-            KeyType::Unknown(_) => PublicKey::new(key_type, scheme, public.as_bytes().to_vec()),
-        }
+            KeyType::Unknown(_) => {
+                return Ok(opaque_key(key_type, scheme, public));
+            }
+        };
+
+        Ok(decoded.unwrap_or_else(|err| fall_back_to_opaque(key_type, scheme, public, err)))
     }
 }
 
@@ -433,10 +440,12 @@ fn convert(jsn: &serde_json::Value) -> std::result::Result<Value, String> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::crypto::{Ed25519PrivateKey, PrivateKey, PublicKey};
+    use crate::crypto::{EcdsaPrivateKey, Ed25519PrivateKey, PrivateKey, PublicKey, RsaPrivateKey};
     use assert_matches::assert_matches;
 
     const PK8_1: &[u8] = include_bytes!("../../../tests/ed25519/ed25519-1.pk8.der");
+    const ECDSA_P256_PK8_1: &[u8] = include_bytes!("../../../tests/ecdsa/ecdsa-p256-1.pk8.der");
+    const RSA_PK8_1: &[u8] = include_bytes!("../../../tests/rsa/rsa-2048-1.pk8.der");
 
     #[test]
     fn ed25519_public_keys_are_hex() {
@@ -451,6 +460,73 @@ mod test {
 
         assert_eq!(&decoded, public_key);
         assert_eq!(decoded.key_id(), public_key.key_id());
+    }
+
+    /// Unlike ed25519, which TUF has always spelled as raw hex, every other key type this crate
+    /// understands is written the way the rest of the ecosystem writes it: as a PEM encoded
+    /// `SubjectPublicKeyInfo`.
+    #[test]
+    fn ecdsa_and_rsa_public_keys_are_pem() {
+        for public_key in [
+            EcdsaPrivateKey::from_pkcs8(ECDSA_P256_PK8_1, SignatureScheme::EcdsaSha2NistP256)
+                .unwrap()
+                .public()
+                .clone(),
+            RsaPrivateKey::from_pkcs8(RSA_PK8_1, SignatureScheme::RsassaPssSha256)
+                .unwrap()
+                .public()
+                .clone(),
+        ] {
+            let public_key = &public_key;
+
+            let encoded = Pouf1::encode_public_key(public_key).unwrap();
+            assert_eq!(encoded, public_key.to_pem().unwrap());
+            assert!(
+                encoded.starts_with("-----BEGIN PUBLIC KEY-----\n"),
+                "{}",
+                encoded,
+            );
+
+            let decoded = Pouf1::decode_public_key(
+                public_key.typ().clone(),
+                public_key.scheme().clone(),
+                &encoded,
+            )
+            .unwrap();
+
+            assert_eq!(&decoded, public_key);
+            assert_eq!(decoded.key_id(), public_key.key_id());
+        }
+    }
+
+    /// A key of a type this crate knows, written in some way it does not, is kept exactly as it
+    /// was written rather than taking the surrounding metadata down with it.
+    #[test]
+    fn a_key_that_cannot_be_decoded_is_kept_opaque() {
+        let key = EcdsaPrivateKey::from_pkcs8(ECDSA_P256_PK8_1, SignatureScheme::EcdsaSha2NistP256)
+            .unwrap();
+        let written = HEXLOWER.encode(key.public().as_bytes());
+
+        let decoded =
+            Pouf1::decode_public_key(KeyType::Ecdsa, SignatureScheme::EcdsaSha2NistP256, &written)
+                .unwrap();
+
+        assert!(decoded.is_opaque());
+        assert_ne!(&decoded, key.public());
+
+        // It goes back out byte for byte as it came in...
+        assert_eq!(Pouf1::encode_public_key(&decoded).unwrap(), written);
+
+        // ... and it can never be used for anything.
+        assert_matches!(decoded.to_pem(), Err(Error::UnknownKeyType(_)));
+        assert_matches!(
+            decoded.verify(
+                &crate::metadata::MetadataPath::root(),
+                b"test",
+                &key.sign(b"test").unwrap(),
+            ),
+            Err(Error::UnknownKeyType(_))
+        );
     }
 
     /// A key type this crate does not understand is left exactly as it was written, because this
@@ -471,18 +547,19 @@ mod test {
         );
     }
 
+    /// An ed25519 key written as PEM rather than as hex is not the ed25519 key it claims to be,
+    /// so it is kept opaque rather than quietly read in the other pouf's encoding.
     #[test]
-    fn decoding_an_ed25519_public_key_that_is_not_hex_fails() {
+    fn an_ed25519_public_key_that_is_not_hex_is_kept_opaque() {
         let key = Ed25519PrivateKey::from_pkcs8(PK8_1).unwrap();
+        let written = key.public().to_pem().unwrap();
 
-        assert_matches!(
-            Pouf1::decode_public_key(
-                KeyType::Ed25519,
-                SignatureScheme::Ed25519,
-                &key.public().to_pem().unwrap(),
-            ),
-            Err(Error::Encoding(_))
-        );
+        let decoded =
+            Pouf1::decode_public_key(KeyType::Ed25519, SignatureScheme::Ed25519, &written).unwrap();
+
+        assert!(decoded.is_opaque());
+        assert_ne!(&decoded, key.public());
+        assert_eq!(Pouf1::encode_public_key(&decoded).unwrap(), written);
     }
 
     #[test]

@@ -6,11 +6,53 @@ pub(crate) mod shims;
 pub use pouf1::Pouf1;
 pub use pouf2::{PAYLOAD_TYPE, Payload, Pouf2};
 
+use log::warn;
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
 use crate::Result;
 use crate::crypto::{KeyType, PublicKey, Signature, SignatureScheme};
+use crate::error::Error;
+
+/// Hold a public key exactly as the metadata wrote it, without interpreting it.
+pub(crate) fn opaque_key(key_type: KeyType, scheme: SignatureScheme, public: &str) -> PublicKey {
+    PublicKey::opaque(key_type, scheme, public.as_bytes().to_vec())
+}
+
+/// Give back the bytes an [opaque](PublicKey::is_opaque) key was read from.
+pub(crate) fn opaque_public_key(public_key: &PublicKey) -> Result<String> {
+    std::str::from_utf8(public_key.as_bytes())
+        .map(|public| public.to_string())
+        .map_err(|err| {
+            Error::Encoding(format!(
+                "public key of key type {} is not a string: {}",
+                public_key.typ(),
+                err,
+            ))
+        })
+}
+
+/// Keep a key that could not be decoded, rather than failing the metadata that carries it.
+///
+/// A repository is free to hold keys this crate cannot use: key types it has never heard of, key
+/// types it knows but on parameters it does not implement - an ECDSA key on a curve other than
+/// P-256, say - and keys that are simply malformed. None of those stop the rest of the metadata
+/// from being read, because a client usually has no need of the key in question, and the ones it
+/// does need have to verify a signature before they are trusted anyway. Such a key is inert: it
+/// is written back out untouched and can never verify anything.
+pub(crate) fn fall_back_to_opaque(
+    key_type: KeyType,
+    scheme: SignatureScheme,
+    public: &str,
+    err: Error,
+) -> PublicKey {
+    warn!(
+        "Keeping {} key with scheme {} as an opaque value, it cannot be used: {}",
+        key_type, scheme, err,
+    );
+
+    opaque_key(key_type, scheme, public)
+}
 
 /// The `{"signatures": ..., "signed": ...}` document that the JSON poufs write.
 #[derive(serde::Serialize)]

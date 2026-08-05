@@ -7,7 +7,7 @@ use {
 use crate::Result;
 use crate::crypto::{KeyId, KeyType, PublicKey, Signature, SignatureScheme, SignatureValue};
 use crate::error::Error;
-use crate::pouf::Pouf;
+use crate::pouf::{Pouf, fall_back_to_opaque, opaque_key, opaque_public_key};
 
 /// The DSSE payload type of TUF metadata encoded with [Pouf2].
 pub const PAYLOAD_TYPE: &str = "application/vnd.tuf+json";
@@ -49,9 +49,9 @@ pub const PAYLOAD_TYPE: &str = "application/vnd.tuf+json";
 ///
 /// `PUBLIC` is a PEM encoded `SubjectPublicKeyInfo` DER public key, using the `PUBLIC KEY` label.
 ///
-/// `KEY_TYPE` is a string (`ed25519` is the only one currently supported).
+/// `KEY_TYPE` is a string (such as `ed25519`, `ecdsa`, or `rsa`).
 ///
-/// `SCHEME` is a string (`ed25519` is the only one currently supported).
+/// `SCHEME` is a string (such as `ed25519`, `ecdsa-sha2-nistp256`, or `rsassa-pss-sha256`).
 ///
 /// `HASH_VALUE` is a hex encoded hash value.
 ///
@@ -264,19 +264,15 @@ impl Pouf for Pouf2 {
     /// );
     /// ```
     fn encode_public_key(public_key: &PublicKey) -> Result<String> {
+        // A key this crate never made sense of is handed back exactly as it was read, because
+        // there is nothing else it could honestly be written as.
+        if public_key.is_opaque() {
+            return opaque_public_key(public_key);
+        }
+
         match public_key.typ() {
-            KeyType::Ed25519 => public_key.to_pem(),
-            // This crate has no idea how a key type it does not understand is spelled, so the
-            // value is handed back exactly as it was read.
-            KeyType::Unknown(_) => std::str::from_utf8(public_key.as_bytes())
-                .map(|public| public.to_string())
-                .map_err(|err| {
-                    Error::Encoding(format!(
-                        "public key of unknown key type {} is not a string: {}",
-                        public_key.typ(),
-                        err,
-                    ))
-                }),
+            KeyType::Ed25519 | KeyType::Ecdsa | KeyType::Rsa => public_key.to_pem(),
+            KeyType::Unknown(_) => opaque_public_key(public_key),
         }
     }
 
@@ -285,12 +281,16 @@ impl Pouf for Pouf2 {
         scheme: SignatureScheme,
         public: &str,
     ) -> Result<PublicKey> {
-        match key_type {
-            KeyType::Ed25519 => PublicKey::from_pem(public, key_type, scheme),
-            // Keep it as it was written, so that metadata carrying key types this crate cannot
-            // use is still readable, and still round trips.
-            KeyType::Unknown(_) => PublicKey::new(key_type, scheme, public.as_bytes().to_vec()),
-        }
+        let decoded = match key_type {
+            KeyType::Ed25519 | KeyType::Ecdsa | KeyType::Rsa => {
+                PublicKey::from_pem(public, key_type.clone(), scheme.clone())
+            }
+            KeyType::Unknown(_) => {
+                return Ok(opaque_key(key_type, scheme, public));
+            }
+        };
+
+        Ok(decoded.unwrap_or_else(|err| fall_back_to_opaque(key_type, scheme, public, err)))
     }
 
     /// Write the metadata and its signatures out as a DSSE envelope.
@@ -398,13 +398,17 @@ impl Eq for Payload {}
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::crypto::{Ed25519PrivateKey, PrivateKey, PublicKey, SignatureScheme};
+    use crate::crypto::{
+        EcdsaPrivateKey, Ed25519PrivateKey, PrivateKey, PublicKey, RsaPrivateKey, SignatureScheme,
+    };
     use assert_matches::assert_matches;
     use data_encoding::HEXLOWER;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
     const PK8_1: &[u8] = include_bytes!("../../../tests/ed25519/ed25519-1.pk8.der");
+    const ECDSA_P256_PK8_1: &[u8] = include_bytes!("../../../tests/ecdsa/ecdsa-p256-1.pk8.der");
+    const RSA_PK8_1: &[u8] = include_bytes!("../../../tests/rsa/rsa-2048-1.pk8.der");
 
     #[test]
     fn payload_keeps_the_bytes_it_was_built_from() {
@@ -463,6 +467,37 @@ mod test {
         assert_eq!(decoded.key_id(), public_key.key_id());
     }
 
+    /// Every key type this pouf understands is written as PEM, not just ed25519.
+    #[test]
+    fn ecdsa_and_rsa_public_keys_are_pem_too() {
+        for public_key in [
+            EcdsaPrivateKey::from_pkcs8(ECDSA_P256_PK8_1, SignatureScheme::EcdsaSha2NistP256)
+                .unwrap()
+                .public()
+                .clone(),
+            RsaPrivateKey::from_pkcs8(RSA_PK8_1, SignatureScheme::RsassaPssSha256)
+                .unwrap()
+                .public()
+                .clone(),
+        ] {
+            let public_key = &public_key;
+
+            let pem = Pouf2::encode_public_key(public_key).unwrap();
+            assert_eq!(pem, public_key.to_pem().unwrap());
+            assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----\n"), "{}", pem);
+
+            let decoded = Pouf2::decode_public_key(
+                public_key.typ().clone(),
+                public_key.scheme().clone(),
+                &pem,
+            )
+            .unwrap();
+
+            assert_eq!(&decoded, public_key);
+            assert_eq!(decoded.key_id(), public_key.key_id());
+        }
+    }
+
     /// A key type this crate does not understand cannot be re-encoded as anything, so it is left
     /// exactly as it was written. That way a repository can start using a new key type without
     /// older clients failing to read the metadata that carries it.
@@ -482,17 +517,31 @@ mod test {
         );
     }
 
+    /// A key of a type this crate knows, written in some way it does not, is kept exactly as it
+    /// was written rather than taking the surrounding metadata down with it.
     #[test]
-    fn decoding_a_public_key_that_is_not_pem_fails() {
+    fn a_key_that_cannot_be_decoded_is_kept_opaque() {
         let key = Ed25519PrivateKey::from_pkcs8(PK8_1).unwrap();
+        let written = HEXLOWER.encode(key.public().as_bytes());
 
+        let decoded =
+            Pouf2::decode_public_key(KeyType::Ed25519, SignatureScheme::Ed25519, &written).unwrap();
+
+        assert!(decoded.is_opaque());
+        assert_ne!(&decoded, key.public());
+
+        // It goes back out byte for byte as it came in...
+        assert_eq!(Pouf2::encode_public_key(&decoded).unwrap(), written);
+
+        // ... and it can never be used for anything.
+        assert_matches!(decoded.to_pem(), Err(Error::UnknownKeyType(_)));
         assert_matches!(
-            Pouf2::decode_public_key(
-                KeyType::Ed25519,
-                SignatureScheme::Ed25519,
-                &HEXLOWER.encode(key.public().as_bytes()),
+            decoded.verify(
+                &crate::metadata::MetadataPath::root(),
+                b"test",
+                &key.sign(b"test").unwrap(),
             ),
-            Err(Error::Encoding(_))
+            Err(Error::UnknownKeyType(_))
         );
     }
 

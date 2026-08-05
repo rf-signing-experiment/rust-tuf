@@ -6,8 +6,7 @@ use {
     futures_util::AsyncReadExt as _,
     ring::{
         digest::{self, SHA256, SHA512},
-        rand::SystemRandom,
-        signature::{ED25519, Ed25519KeyPair, KeyPair},
+        signature::VerificationAlgorithm,
     },
     serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeserializeError},
     spki::{
@@ -15,7 +14,7 @@ use {
         SubjectPublicKeyInfoRef,
         der::{
             Decode as _, Encode as _,
-            asn1::BitString,
+            asn1::{Any, BitString, Null},
             pem::{self, LineEnding, PemLabel as _},
         },
     },
@@ -30,23 +29,19 @@ use {
 use crate::error::{Error, Result};
 use crate::metadata::MetadataPath;
 
-const HASH_ALG_PREFS: &[HashAlgorithm] = &[HashAlgorithm::Sha512, HashAlgorithm::Sha256];
+mod ecdsa;
+mod ed25519;
+mod rsa;
 
-/// `id-Ed25519` as defined in [RFC 8410](https://datatracker.ietf.org/doc/html/rfc8410).
-const ED25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
+pub use ecdsa::EcdsaPrivateKey;
+pub use ed25519::Ed25519PrivateKey;
+pub use rsa::RsaPrivateKey;
+
+const HASH_ALG_PREFS: &[HashAlgorithm] = &[HashAlgorithm::Sha512, HashAlgorithm::Sha256];
 
 /// The PEM label public keys are written with, per
 /// [RFC 7468](https://datatracker.ietf.org/doc/html/rfc7468#section-13).
 pub(crate) const PUBLIC_KEY_PEM_LABEL: &str = SubjectPublicKeyInfoRef::PEM_LABEL;
-
-/// The length of an ed25519 private key in bytes
-const ED25519_PRIVATE_KEY_LENGTH: usize = 32;
-
-/// The length of an ed25519 public key in bytes
-const ED25519_PUBLIC_KEY_LENGTH: usize = 32;
-
-/// The length of an ed25519 keypair in bytes
-const ED25519_KEYPAIR_LENGTH: usize = ED25519_PRIVATE_KEY_LENGTH + ED25519_PUBLIC_KEY_LENGTH;
 
 fn spki_error(err: impl Display) -> Error {
     Error::Encoding(format!("SPKI: {}", err))
@@ -185,16 +180,196 @@ where
     Ok((size, hashes))
 }
 
+/// A way of writing key material.
+///
+/// This names how a key's bytes are encoded - and so how it is recognized, checked, and written
+/// back out - which is a separate question from which signatures it can check. A single algorithm
+/// may sign under several schemes, and adding one of those does not touch this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum KeyAlgorithm {
+    Ed25519,
+    NistP256,
+    Rsa,
+}
+
+/// Every key algorithm this crate implements.
+///
+/// Adding one means adding its module, its spec, and an entry here. Nothing else dispatches on
+/// the algorithm.
+const ALL_KEY_ALGORITHMS: &[KeyAlgorithm] = &[
+    KeyAlgorithm::Ed25519,
+    KeyAlgorithm::NistP256,
+    KeyAlgorithm::Rsa,
+];
+
+impl KeyAlgorithm {
+    /// The algorithm a `SubjectPublicKeyInfo` says its key is, or `None` if this crate does not
+    /// implement it.
+    ///
+    /// A `SubjectPublicKeyInfo` names its own algorithm, so nothing has to be assumed about what
+    /// a key of some TUF key type looks like: two ECDSA curves, or two RSA variants, are told
+    /// apart by what the key itself says.
+    fn for_spki(oid: ObjectIdentifier, parameters: Option<ObjectIdentifier>) -> Option<Self> {
+        ALL_KEY_ALGORITHMS
+            .iter()
+            .copied()
+            .find(|algorithm| algorithm.oids() == (oid, parameters))
+    }
+
+    /// The algorithm that raw key material of the given type, signing under the given scheme, is
+    /// written as.
+    ///
+    /// This is for the encodings that are not self describing, such as the bare ed25519 bytes
+    /// POUF-1 writes. Where a key type has more than one encoding the scheme is what tells them
+    /// apart, and where it has only one that is the answer whatever the scheme says - so a scheme
+    /// this crate has not implemented still leaves the key readable, and merely unusable.
+    fn for_key_material(key_type: &KeyType, scheme: &SignatureScheme) -> Option<Self> {
+        let of_type = || {
+            ALL_KEY_ALGORITHMS
+                .iter()
+                .copied()
+                .filter(|algorithm| algorithm.spec().key_type == key_type.as_str())
+        };
+
+        if let Some(algorithm) = of_type().find(|a| a.verification_algorithm(scheme).is_some()) {
+            return Some(algorithm);
+        }
+
+        let mut candidates = of_type();
+
+        match (candidates.next(), candidates.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Everything this crate knows about how keys of this algorithm are written and checked.
+    fn spec(self) -> &'static AlgorithmSpec {
+        match self {
+            KeyAlgorithm::Ed25519 => &ed25519::SPEC,
+            KeyAlgorithm::NistP256 => &ecdsa::NIST_P256_SPEC,
+            KeyAlgorithm::Rsa => &rsa::SPEC,
+        }
+    }
+
+    /// The algorithm OID, and the parameters OID if this algorithm takes one, that name keys of
+    /// this algorithm inside a `SubjectPublicKeyInfo`.
+    ///
+    /// This is the form used to recognize a key that has been read. The `NULL` parameters that
+    /// [`algorithm_identifier`](Self::algorithm_identifier) writes for an RSA key read back as
+    /// absent, which is how they are spelled here.
+    fn oids(self) -> (ObjectIdentifier, Option<ObjectIdentifier>) {
+        let spec = self.spec();
+
+        (spec.oid, spec.parameters.oid())
+    }
+
+    /// The `AlgorithmIdentifier` that names keys of this algorithm inside a
+    /// `SubjectPublicKeyInfo`.
+    fn algorithm_identifier(self) -> Result<AlgorithmIdentifierOwned> {
+        let spec = self.spec();
+
+        Ok(AlgorithmIdentifierOwned {
+            oid: spec.oid,
+            parameters: spec.parameters.encode()?,
+        })
+    }
+
+    /// The algorithm a signature made by this key under `scheme` is checked with, or `None` if
+    /// this crate cannot check that pairing.
+    fn verification_algorithm(
+        self,
+        scheme: &SignatureScheme,
+    ) -> Option<&'static dyn VerificationAlgorithm> {
+        (self.spec().verification)(scheme)
+    }
+
+    /// Check that `public` is shaped like a public key of this algorithm.
+    ///
+    /// This rejects the mistakes that are worth catching early, such as a key on the wrong curve
+    /// or a key that was written in some encoding other than the one the metadata claims. It is
+    /// not a substitute for the validation the verification algorithm does.
+    fn check_public_key(self, public: &[u8]) -> Result<()> {
+        (self.spec().check_public_key)(public)
+    }
+
+    fn name(self) -> &'static str {
+        self.spec().name
+    }
+}
+
+/// What this crate needs to know about one key algorithm.
+///
+/// Each algorithm this crate implements lives in its own module and describes itself with one of
+/// these, so that the parts that are common to all of them - naming a key, writing it as a
+/// `SubjectPublicKeyInfo`, checking a signature with it - have nothing algorithm specific in them.
+struct AlgorithmSpec {
+    /// What this algorithm is called in error messages.
+    name: &'static str,
+
+    /// The TUF key type that keys of this algorithm are spelled with.
+    ///
+    /// Several algorithms may share one, as two ECDSA curves would: the key type says what kind
+    /// of key it is, not how it is parameterized.
+    key_type: &'static str,
+
+    /// The OID that names keys of this algorithm inside a `SubjectPublicKeyInfo`.
+    oid: ObjectIdentifier,
+
+    /// How that algorithm identifier spells its parameters.
+    parameters: AlgorithmParameters,
+
+    /// The algorithm a signature made under some scheme is checked with, if these keys can sign
+    /// that way. Teaching an algorithm a further scheme is a matter for this function alone.
+    verification: fn(&SignatureScheme) -> Option<&'static dyn VerificationAlgorithm>,
+
+    /// Check that some bytes are shaped like a public key of this algorithm.
+    check_public_key: fn(&[u8]) -> Result<()>,
+}
+
+/// The parameters of a key algorithm's `AlgorithmIdentifier`.
+///
+/// Which of these an algorithm uses is fixed by its own specification, and getting it wrong
+/// produces a key that other implementations will not read.
+enum AlgorithmParameters {
+    /// The parameters must be absent.
+    Absent,
+
+    /// The parameters must be present, and must be `NULL`.
+    Null,
+
+    /// The parameters name something, such as the curve an elliptic curve key lies on.
+    Oid(ObjectIdentifier),
+}
+
+impl AlgorithmParameters {
+    /// The parameters as they are compared when reading a key.
+    ///
+    /// An explicit `NULL` reads back the same as absent parameters, so both are `None` here.
+    fn oid(&self) -> Option<ObjectIdentifier> {
+        match *self {
+            AlgorithmParameters::Absent | AlgorithmParameters::Null => None,
+            AlgorithmParameters::Oid(oid) => Some(oid),
+        }
+    }
+
+    /// The parameters as they are written out.
+    fn encode(&self) -> Result<Option<Any>> {
+        match *self {
+            AlgorithmParameters::Absent => Ok(None),
+            AlgorithmParameters::Null => Any::encode_from(&Null).map(Some).map_err(spki_error),
+            AlgorithmParameters::Oid(oid) => Any::encode_from(&oid).map(Some).map_err(spki_error),
+        }
+    }
+}
+
 /// Derive a key id from the key material itself.
 ///
 /// This is the SHA-256 digest of the key's `SubjectPublicKeyInfo`, which is the same fingerprint
-/// [RFC 7469](https://datatracker.ietf.org/doc/html/rfc7469#section-2.4) defines. Key types this
-/// crate cannot write a `SubjectPublicKeyInfo` for are digested as-is.
-fn calculate_key_id(key_type: &KeyType, public_key: &[u8]) -> Result<KeyId> {
-    let bytes = match key_type.oid() {
-        Some(_) => write_spki(public_key, key_type)?,
-        None => public_key.to_vec(),
-    };
+/// [RFC 7469](https://datatracker.ietf.org/doc/html/rfc7469#section-2.4) defines. A key this
+/// crate cannot write a `SubjectPublicKeyInfo` for is named by [`PublicKey::opaque`] instead.
+fn calculate_key_id(algorithm: KeyAlgorithm, public_key: &[u8]) -> Result<KeyId> {
+    let bytes = write_spki(public_key, algorithm)?;
 
     let mut context = digest::Context::new(&SHA256);
     context.update(&bytes);
@@ -254,6 +429,14 @@ pub enum SignatureScheme {
     /// [Ed25519](https://ed25519.cr.yp.to/)
     Ed25519,
 
+    /// ECDSA over NIST P-256 with SHA-256, signature values encoded as an ASN.1
+    /// `Ecdsa-Sig-Value`.
+    EcdsaSha2NistP256,
+
+    /// RSASSA-PSS with SHA-256 as both the message digest and the MGF1 digest, and a salt as
+    /// long as that digest.
+    RsassaPssSha256,
+
     /// Placeholder for an unknown scheme.
     Unknown(String),
 }
@@ -263,6 +446,8 @@ impl SignatureScheme {
     pub fn new(name: &str) -> Self {
         match name {
             "ed25519" => SignatureScheme::Ed25519,
+            "ecdsa-sha2-nistp256" => SignatureScheme::EcdsaSha2NistP256,
+            "rsassa-pss-sha256" => SignatureScheme::RsassaPssSha256,
             scheme => SignatureScheme::Unknown(scheme.to_string()),
         }
     }
@@ -271,6 +456,8 @@ impl SignatureScheme {
     pub fn as_str(&self) -> &str {
         match *self {
             SignatureScheme::Ed25519 => "ed25519",
+            SignatureScheme::EcdsaSha2NistP256 => "ecdsa-sha2-nistp256",
+            SignatureScheme::RsassaPssSha256 => "rsassa-pss-sha256",
             SignatureScheme::Unknown(ref s) => s,
         }
     }
@@ -331,6 +518,16 @@ pub enum KeyType {
     /// [Ed25519](https://ed25519.cr.yp.to/)
     Ed25519,
 
+    /// [ECDSA](https://csrc.nist.gov/pubs/fips/186-5/final) over a NIST prime curve.
+    ///
+    /// The curve is named by the [`SignatureScheme`] the key is used with, not by the key type.
+    Ecdsa,
+
+    /// [RSA](https://datatracker.ietf.org/doc/html/rfc8017).
+    ///
+    /// How the key signs is named by the [`SignatureScheme`] it is used with.
+    Rsa,
+
     /// Placeholder for an unknown key type.
     Unknown(String),
 }
@@ -340,6 +537,13 @@ impl KeyType {
     pub fn new(name: &str) -> Self {
         match name {
             "ed25519" => KeyType::Ed25519,
+            "ecdsa" => KeyType::Ecdsa,
+            "rsa" => KeyType::Rsa,
+            // Older TUF metadata spelled an ECDSA key type with the curve baked into it. It names
+            // the same kind of key, and the curve is carried by the scheme either way, so such a
+            // key is read as an ordinary `ecdsa` key. Note that this crate then writes the key
+            // back out under the modern spelling.
+            "ecdsa-sha2-nistp256" => KeyType::Ecdsa,
             keytype => KeyType::Unknown(keytype.to_string()),
         }
     }
@@ -348,16 +552,9 @@ impl KeyType {
     pub fn as_str(&self) -> &str {
         match *self {
             KeyType::Ed25519 => "ed25519",
+            KeyType::Ecdsa => "ecdsa",
+            KeyType::Rsa => "rsa",
             KeyType::Unknown(ref s) => s,
-        }
-    }
-
-    /// Return the algorithm identifier this key type is written with inside a
-    /// `SubjectPublicKeyInfo`, if this crate knows one.
-    fn oid(&self) -> Option<ObjectIdentifier> {
-        match *self {
-            KeyType::Ed25519 => Some(ED25519_OID),
-            KeyType::Unknown(_) => None,
         }
     }
 }
@@ -393,90 +590,6 @@ pub trait PrivateKey {
     fn public(&self) -> &PublicKey;
 }
 
-/// A structure containing information about an Ed25519 private key.
-pub struct Ed25519PrivateKey {
-    private: Ed25519KeyPair,
-    public: PublicKey,
-}
-
-impl Ed25519PrivateKey {
-    /// Generate Ed25519 key bytes in pkcs8 format.
-    pub fn pkcs8() -> Result<Vec<u8>> {
-        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-            .map(|bytes| bytes.as_ref().to_vec())
-            .map_err(|_| Error::Opaque("Failed to generate Ed25519 key".into()))
-    }
-
-    /// Create a new `PrivateKey` from an ed25519 keypair. The keypair is a 64 byte slice, where the
-    /// first 32 bytes are the ed25519 seed, and the second 32 bytes are the public key.
-    pub fn from_ed25519(key: &[u8]) -> Result<Self> {
-        if key.len() != ED25519_KEYPAIR_LENGTH {
-            return Err(Error::Encoding(
-                "ed25519 private keys must be 64 bytes long".into(),
-            ));
-        }
-
-        let private_key_bytes = &key[..ED25519_PRIVATE_KEY_LENGTH];
-        let public_key_bytes = &key[ED25519_PUBLIC_KEY_LENGTH..];
-
-        let private = Ed25519KeyPair::from_seed_and_public_key(private_key_bytes, public_key_bytes)
-            .map_err(|err| Error::Encoding(err.to_string()))?;
-        Self::from_keypair(private)
-    }
-
-    /// Create a private key from PKCS#8v2 DER bytes.
-    ///
-    /// # Generating Keys
-    ///
-    /// ```bash
-    /// $ touch ed25519-private-key.pk8
-    /// $ chmod 0600 ed25519-private-key.pk8
-    /// ```
-    ///
-    /// ```no_run
-    /// # use ring::rand::SystemRandom;
-    /// # use ring::signature::Ed25519KeyPair;
-    /// # use std::fs::File;
-    /// # use std::io::Write;
-    /// #
-    /// let mut file = File::open("ed25519-private-key.pk8").unwrap();
-    /// let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-    /// file.write_all(key.as_ref()).unwrap()
-    /// ```
-    pub fn from_pkcs8(der_key: &[u8]) -> Result<Self> {
-        Self::from_keypair(
-            Ed25519KeyPair::from_pkcs8(der_key)
-                .map_err(|_| Error::Encoding("Could not parse key as PKCS#8v2".into()))?,
-        )
-    }
-
-    fn from_keypair(private: Ed25519KeyPair) -> Result<Self> {
-        let public = PublicKey::new(
-            KeyType::Ed25519,
-            SignatureScheme::Ed25519,
-            private.public_key().as_ref().to_vec(),
-        )?;
-
-        Ok(Ed25519PrivateKey { private, public })
-    }
-}
-
-impl PrivateKey for Ed25519PrivateKey {
-    fn sign(&self, msg: &[u8]) -> Result<Signature> {
-        debug_assert!(self.public.scheme == SignatureScheme::Ed25519);
-
-        let value = SignatureValue(self.private.sign(msg).as_ref().into());
-        Ok(Signature {
-            key_id: self.public.key_id().clone(),
-            value,
-        })
-    }
-
-    fn public(&self) -> &PublicKey {
-        &self.public
-    }
-}
-
 /// A structure containing information about a public key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PublicKey {
@@ -492,20 +605,59 @@ impl PublicKey {
     /// The key is named by [deriving a key id](KeyId) from its own bytes. Use
     /// [`with_key_id`](Self::with_key_id) to name it something else.
     pub fn new(typ: KeyType, scheme: SignatureScheme, value: Vec<u8>) -> Result<Self> {
-        if typ == KeyType::Ed25519 && value.len() != ED25519_PUBLIC_KEY_LENGTH {
-            return Err(Error::IllegalArgument(
-                "ed25519 keys must be 32 bytes long".into(),
-            ));
-        }
+        // A key this crate cannot place is one whose bytes it cannot interpret, so it can only be
+        // carried through opaquely.
+        let Some(algorithm) = KeyAlgorithm::for_key_material(&typ, &scheme) else {
+            return Ok(Self::opaque(typ, scheme, value));
+        };
 
-        let key_id = calculate_key_id(&typ, &value)?;
-        let value = PublicKeyValue(value);
+        Self::known(algorithm, typ, scheme, value)
+    }
+
+    /// Create a key whose algorithm has already been settled.
+    fn known(
+        algorithm: KeyAlgorithm,
+        typ: KeyType,
+        scheme: SignatureScheme,
+        value: Vec<u8>,
+    ) -> Result<Self> {
+        algorithm.check_public_key(&value)?;
+
         Ok(PublicKey {
+            key_id: calculate_key_id(algorithm, &value)?,
             typ,
-            key_id,
             scheme,
-            value,
+            value: PublicKeyValue::Known {
+                algorithm,
+                bytes: value,
+            },
         })
+    }
+
+    /// Create a key this crate cannot interpret from the bytes the metadata carried.
+    ///
+    /// The key is named by the digest of those bytes, is handed back by
+    /// [`as_bytes`](Self::as_bytes) exactly as it came in, and can never verify a signature. This
+    /// is how a [pouf](crate::pouf::Pouf) carries a key whose type or encoding it does not
+    /// understand without making the rest of the metadata unreadable.
+    pub fn opaque(typ: KeyType, scheme: SignatureScheme, value: Vec<u8>) -> Self {
+        let mut context = digest::Context::new(&SHA256);
+        context.update(&value);
+
+        PublicKey {
+            typ,
+            key_id: KeyId(HEXLOWER.encode(context.finish().as_ref())),
+            scheme,
+            value: PublicKeyValue::Opaque(value),
+        }
+    }
+
+    /// Whether this crate failed to make sense of this key when it was read.
+    ///
+    /// Such a key is inert: it cannot verify a signature, and it cannot be written as anything
+    /// other than the bytes it arrived as.
+    pub fn is_opaque(&self) -> bool {
+        matches!(self.value, PublicKeyValue::Opaque(_))
     }
 
     /// Name this key with the given key id.
@@ -517,17 +669,14 @@ impl PublicKey {
     }
 
     /// Parse DER bytes as a `SubjectPublicKeyInfo` key.
+    ///
+    /// The key type is whatever the encoded key says it is; `scheme` only records how the key is
+    /// authorized to sign.
     pub fn from_spki(der_bytes: &[u8], scheme: SignatureScheme) -> Result<Self> {
-        let typ = match scheme {
-            SignatureScheme::Ed25519 => KeyType::Ed25519,
-            SignatureScheme::Unknown(s) => {
-                return Err(Error::UnknownSignatureScheme(s));
-            }
-        };
+        let (algorithm, value) = read_spki(der_bytes)?;
+        let typ = KeyType::new(algorithm.spec().key_type);
 
-        let value = read_spki(der_bytes, &typ)?;
-
-        Self::new(typ, scheme, value)
+        Self::known(algorithm, typ, scheme, value)
     }
 
     /// Parse a PEM encoded `SubjectPublicKeyInfo` key.
@@ -535,7 +684,8 @@ impl PublicKey {
     /// Returns [`Error::UnknownKeyType`] for a key type this crate cannot read a
     /// `SubjectPublicKeyInfo` for.
     pub fn from_pem(pem: &str, typ: KeyType, scheme: SignatureScheme) -> Result<Self> {
-        if typ.oid().is_none() {
+        // A key type this crate has never heard of is one no encoded key can be read as.
+        if matches!(typ, KeyType::Unknown(_)) {
             return Err(Error::UnknownKeyType(typ.to_string()));
         }
 
@@ -548,14 +698,33 @@ impl PublicKey {
             )));
         }
 
-        let value = read_spki(&der, &typ)?;
+        let (algorithm, value) = read_spki(&der)?;
 
-        Self::new(typ, scheme, value)
+        // The metadata says what kind of key this is meant to be, and the key itself says what it
+        // is. Where they disagree, one of the two is wrong, and neither is worth guessing at.
+        if algorithm.spec().key_type != typ.as_str() {
+            return Err(Error::Encoding(format!(
+                "SPKI: metadata calls this a {} key, but it is {}",
+                typ,
+                algorithm.name(),
+            )));
+        }
+
+        Self::known(algorithm, typ, scheme, value)
     }
 
     /// Write the public key as `SubjectPublicKeyInfo` DER bytes.
+    ///
+    /// Returns [`Error::UnknownKeyType`] for an [opaque](Self::is_opaque) key, whose bytes this
+    /// crate never understood well enough to re-encode.
     pub fn as_spki(&self) -> Result<Vec<u8>> {
-        write_spki(&self.value.0, &self.typ)
+        match self.value {
+            PublicKeyValue::Known {
+                algorithm,
+                ref bytes,
+            } => write_spki(bytes, algorithm),
+            PublicKeyValue::Opaque(_) => Err(Error::UnknownKeyType(self.typ.to_string())),
+        }
     }
 
     /// Write the public key as a PEM encoded `SubjectPublicKeyInfo`.
@@ -565,11 +734,6 @@ impl PublicKey {
     pub fn to_pem(&self) -> Result<String> {
         pem::encode_string(PUBLIC_KEY_PEM_LABEL, LineEnding::LF, &self.as_spki()?)
             .map_err(pem_error)
-    }
-
-    /// Parse ED25519 bytes as a public key.
-    pub fn from_ed25519<T: Into<Vec<u8>>>(bytes: T) -> Result<Self> {
-        Self::new(KeyType::Ed25519, SignatureScheme::Ed25519, bytes.into())
     }
 
     /// An immutable reference to the key's type.
@@ -589,20 +753,34 @@ impl PublicKey {
 
     /// Return the public key as bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.value.0
+        self.value.as_bytes()
     }
 
     /// Use this key to verify a message with a signature.
     pub fn verify(&self, role: &MetadataPath, msg: &[u8], sig: &Signature) -> Result<()> {
-        let alg: &dyn ring::signature::VerificationAlgorithm = match self.scheme {
-            SignatureScheme::Ed25519 => &ED25519,
-            SignatureScheme::Unknown(ref s) => {
-                return Err(Error::UnknownSignatureScheme(s.to_string()));
-            }
+        // A key that was never understood cannot check anything, whatever it claims to be.
+        let PublicKeyValue::Known {
+            algorithm,
+            ref bytes,
+        } = self.value
+        else {
+            return Err(Error::UnknownKeyType(self.typ.to_string()));
         };
 
-        let key = ring::signature::UnparsedPublicKey::new(alg, &self.value.0);
-        key.verify(msg, &sig.value.0)
+        // Whether this key can check this signature is a question about the scheme it is
+        // authorized to sign with, so an unusable pairing is reported as an unusable scheme.
+        let Some(verification) = algorithm.verification_algorithm(&self.scheme) else {
+            return Err(match self.scheme {
+                SignatureScheme::Unknown(ref s) => Error::UnknownSignatureScheme(s.clone()),
+                ref scheme => Error::IllegalArgument(format!(
+                    "a {} key cannot verify a {} signature",
+                    self.typ, scheme,
+                )),
+            });
+        };
+
+        ring::signature::UnparsedPublicKey::new(verification, bytes)
+            .verify(msg, &sig.value.0)
             .map_err(|_| Error::BadSignature(role.clone()))
     }
 }
@@ -619,13 +797,39 @@ impl PartialOrd for PublicKey {
     }
 }
 
+/// The key material of a [`PublicKey`].
 #[derive(Clone, PartialEq, Hash, Eq)]
-struct PublicKeyValue(Vec<u8>);
+enum PublicKeyValue {
+    /// Key material this crate understands, in the form its algorithm defines.
+    ///
+    /// The algorithm is settled once, when the key is read, and carried along with the bytes. It
+    /// is never re-derived from the key type, which could not tell two ECDSA curves apart.
+    Known {
+        algorithm: KeyAlgorithm,
+        bytes: Vec<u8>,
+    },
+
+    /// A key this crate could not interpret, exactly as the metadata wrote it.
+    Opaque(Vec<u8>),
+}
+
+impl PublicKeyValue {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            PublicKeyValue::Known { bytes, .. } | PublicKeyValue::Opaque(bytes) => bytes,
+        }
+    }
+}
 
 impl Debug for PublicKeyValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("PublicKeyValue")
-            .field(&HEXLOWER.encode(&self.0))
+        let name = match self {
+            PublicKeyValue::Known { .. } => "PublicKeyValue",
+            PublicKeyValue::Opaque(_) => "OpaquePublicKeyValue",
+        };
+
+        f.debug_tuple(name)
+            .field(&HEXLOWER.encode(self.as_bytes()))
             .finish()
     }
 }
@@ -732,45 +936,52 @@ impl Display for HashValue {
 }
 
 /// Write a key's raw bytes as `SubjectPublicKeyInfo` DER bytes.
-pub(crate) fn write_spki(public: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
-    let Some(oid) = key_type.oid() else {
-        return Err(Error::UnknownKeyType(key_type.to_string()));
-    };
-
+fn write_spki(public: &[u8], algorithm: KeyAlgorithm) -> Result<Vec<u8>> {
     let spki = SubjectPublicKeyInfoOwned {
-        // RFC 8410 §3: for the id-Ed25519 algorithm the parameters must be absent.
-        algorithm: AlgorithmIdentifierOwned {
-            oid,
-            parameters: None,
-        },
+        algorithm: algorithm.algorithm_identifier()?,
         subject_public_key: BitString::new(0, public).map_err(spki_error)?,
     };
 
     spki.to_der().map_err(spki_error)
 }
 
-/// Read a key's raw bytes out of `SubjectPublicKeyInfo` DER bytes.
-pub(crate) fn read_spki(der_bytes: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
-    let Some(oid) = key_type.oid() else {
-        return Err(Error::UnknownKeyType(key_type.to_string()));
-    };
-
+/// Read a key out of `SubjectPublicKeyInfo` DER bytes, along with the algorithm it says it is.
+fn read_spki(der_bytes: &[u8]) -> Result<(KeyAlgorithm, Vec<u8>)> {
     let spki = SubjectPublicKeyInfoRef::from_der(der_bytes).map_err(spki_error)?;
 
-    if spki.algorithm.oid != oid {
-        return Err(Error::Encoding(format!(
-            "SPKI: expected a {} key ({}), found {}",
-            key_type, oid, spki.algorithm.oid,
-        )));
-    }
+    // `oids` reads the parameters as the curve name they are for an elliptic curve key, and
+    // reports an explicit NULL as absent. Older versions of this crate wrote out that NULL for
+    // the ed25519 algorithm, which RFC 8410 §3 says must be absent, so both spellings are
+    // accepted here.
+    let (oid, parameters) = spki.algorithm.oids().map_err(spki_error)?;
 
-    // Older versions of this crate wrote out an explicit NULL for the ed25519 algorithm's
-    // parameters, which RFC 8410 §3 says must be absent, so both spellings are accepted here.
+    let algorithm = KeyAlgorithm::for_spki(oid, parameters).ok_or_else(|| {
+        Error::Encoding(format!(
+            "SPKI: no support for keys of algorithm {}",
+            DisplayAlgorithm((oid, parameters)),
+        ))
+    })?;
 
-    spki.subject_public_key
+    let public = spki
+        .subject_public_key
         .as_bytes()
-        .ok_or_else(|| Error::Encoding("SPKI: public key is not a whole number of bytes".into()))
-        .map(|bytes| bytes.to_vec())
+        .ok_or_else(|| Error::Encoding("SPKI: public key is not a whole number of bytes".into()))?;
+
+    algorithm.check_public_key(public)?;
+
+    Ok((algorithm, public.to_vec()))
+}
+
+/// Render an algorithm identifier's OIDs for an error message.
+struct DisplayAlgorithm((ObjectIdentifier, Option<ObjectIdentifier>));
+
+impl Display for DisplayAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            (oid, Some(parameters)) => write!(f, "{} {}", oid, parameters),
+            (oid, None) => write!(f, "{}", oid),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -780,67 +991,10 @@ mod test {
     use pretty_assertions::assert_eq;
     use serde_json::{self, json};
 
-    mod ed25519 {
-        pub(super) const PRIVATE_KEY: &[u8] = include_bytes!("../tests/ed25519/ed25519-1");
-        pub(super) const PUBLIC_KEY: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.pub");
-        pub(super) const PK8_1: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.pk8.der");
-        pub(super) const SPKI_1: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.spki.der");
-        pub(super) const PK8_2: &[u8] = include_bytes!("../tests/ed25519/ed25519-2.pk8.der");
-    }
+    use super::ecdsa::test_data as ecdsa;
+    use super::ed25519::test_data as ed25519;
+    use super::rsa::test_data as rsa;
 
-    #[test]
-    fn parse_public_ed25519_spki() {
-        let key = PublicKey::from_spki(ed25519::SPKI_1, SignatureScheme::Ed25519).unwrap();
-        assert_eq!(key.typ, KeyType::Ed25519);
-        assert_eq!(key.scheme, SignatureScheme::Ed25519);
-        assert_eq!(key.as_bytes(), ed25519::PUBLIC_KEY);
-    }
-
-    /// Earlier versions of this crate wrote an explicit NULL for the ed25519 algorithm's
-    /// parameters, which RFC 8410 says must be absent. Keys written that way must still parse.
-    #[test]
-    fn parse_public_ed25519_spki_with_null_parameters() {
-        let mut der = vec![
-            0x30, 0x2c, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x05, 0x00, 0x03, 0x21, 0x00,
-        ];
-        der.extend_from_slice(ed25519::PUBLIC_KEY);
-
-        let key = PublicKey::from_spki(&der, SignatureScheme::Ed25519).unwrap();
-        assert_eq!(key.as_bytes(), ed25519::PUBLIC_KEY);
-
-        // ... but they are rewritten without it.
-        assert_ne!(key.as_spki().unwrap(), der);
-        assert_eq!(
-            key.as_spki().unwrap(),
-            PublicKey::from_ed25519(ed25519::PUBLIC_KEY)
-                .unwrap()
-                .as_spki()
-                .unwrap(),
-        );
-    }
-
-    #[test]
-    fn parse_public_ed25519() {
-        let key = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
-        assert_eq!(
-            key.key_id(),
-            &KeyId::from_str("061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f")
-                .unwrap()
-        );
-        assert_eq!(key.typ, KeyType::Ed25519);
-        assert_eq!(key.scheme, SignatureScheme::Ed25519);
-    }
-
-    #[test]
-    fn parse_public_ed25519_rejects_the_wrong_length() {
-        assert_matches!(
-            PublicKey::from_ed25519(vec![0; 31]),
-            Err(Error::IllegalArgument(_))
-        );
-    }
-
-    /// A key that is not named by the metadata that carries it is named by the digest of its
-    /// `SubjectPublicKeyInfo`.
     #[test]
     fn key_id_is_derived_from_the_key_material() {
         let key = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
@@ -883,66 +1037,6 @@ mod test {
     }
 
     #[test]
-    fn ed25519_read_pkcs8_and_sign() {
-        let key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_1).unwrap();
-        let msg = b"test";
-
-        let sig = key.sign(msg).unwrap();
-
-        let pub_key =
-            PublicKey::from_spki(&key.public.as_spki().unwrap(), SignatureScheme::Ed25519).unwrap();
-
-        let role = MetadataPath::root();
-        assert_matches!(pub_key.verify(&role, msg, &sig), Ok(()));
-
-        // Make sure we match what ring expects.
-        let ring_key = ring::signature::Ed25519KeyPair::from_pkcs8(ed25519::PK8_1).unwrap();
-        assert_eq!(key.public().as_bytes(), ring_key.public_key().as_ref());
-        assert_eq!(sig.value().as_bytes(), ring_key.sign(msg).as_ref());
-
-        // Make sure verification fails with the wrong key.
-        let bad_pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2)
-            .unwrap()
-            .public()
-            .clone();
-
-        assert_matches!(
-            bad_pub_key.verify(&role, msg, &sig),
-            Err(Error::BadSignature(r))
-            if r == role
-        );
-    }
-
-    #[test]
-    fn ed25519_read_keypair_and_sign() {
-        let key = Ed25519PrivateKey::from_ed25519(ed25519::PRIVATE_KEY).unwrap();
-        let pub_key = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
-        assert_eq!(key.public(), &pub_key);
-
-        let role = MetadataPath::root();
-        let msg = b"test";
-        let sig = key.sign(msg).unwrap();
-        assert_matches!(pub_key.verify(&role, msg, &sig), Ok(()));
-
-        // Make sure we match what ring expects.
-        let ring_key = ring::signature::Ed25519KeyPair::from_pkcs8(ed25519::PK8_1).unwrap();
-        assert_eq!(key.public().as_bytes(), ring_key.public_key().as_ref());
-        assert_eq!(sig.value().as_bytes(), ring_key.sign(msg).as_ref());
-
-        // Make sure verification fails with the wrong key.
-        let bad_pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2)
-            .unwrap()
-            .public()
-            .clone();
-
-        assert_matches!(
-            bad_pub_key.verify(&role, msg, &sig),
-            Err(Error::BadSignature(r))
-            if r == role
-        );
-    }
-
-    #[test]
     fn unknown_keytype_cannot_verify() {
         let pub_key = PublicKey::new(
             KeyType::Unknown("unknown-keytype".into()),
@@ -957,10 +1051,11 @@ mod test {
             value: SignatureValue(b"sig-value".to_vec()),
         };
 
+        assert!(pub_key.is_opaque());
         assert_matches!(
             pub_key.verify(&role, msg, &sig),
-            Err(Error::UnknownSignatureScheme(s))
-            if s == "unknown-scheme"
+            Err(Error::UnknownKeyType(t))
+            if t == "unknown-keytype"
         );
     }
 
@@ -1061,22 +1156,7 @@ mod test {
         assert_eq!(decoded, sig);
     }
 
-    #[test]
-    fn new_ed25519_key() {
-        let bytes = Ed25519PrivateKey::pkcs8().unwrap();
-        let _ = Ed25519PrivateKey::from_pkcs8(&bytes).unwrap();
-    }
-
-    #[test]
-    fn test_ed25519_public_key_eq() {
-        let key1 = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_1).unwrap();
-        let key2 = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2).unwrap();
-
-        assert_eq!(key1.public(), key1.public());
-        assert_ne!(key1.public(), key2.public());
-    }
-
-    fn check_public_key_hash(key1: &PublicKey, key2: &PublicKey) {
+    pub(super) fn check_public_key_hash(key1: &PublicKey, key2: &PublicKey) {
         use std::hash::BuildHasher;
 
         let state = std::collections::hash_map::RandomState::new();
@@ -1084,11 +1164,73 @@ mod test {
         assert_ne!(state.hash_one(key1), state.hash_one(key2));
     }
 
+    /// Reading a key as the wrong algorithm must fail rather than silently produce a key that
+    /// cannot verify anything.
     #[test]
-    fn test_ed25519_public_key_hash() {
-        let key1 = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_1).unwrap();
-        let key2 = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2).unwrap();
+    fn pem_rejects_a_key_of_another_algorithm() {
+        assert_matches!(
+            PublicKey::from_pem(
+                ecdsa::P256_PEM_1,
+                KeyType::Rsa,
+                SignatureScheme::RsassaPssSha256
+            ),
+            Err(Error::Encoding(_))
+        );
+        assert_matches!(
+            PublicKey::from_pem(
+                rsa::PEM_1,
+                KeyType::Ecdsa,
+                SignatureScheme::EcdsaSha2NistP256
+            ),
+            Err(Error::Encoding(_))
+        );
+    }
 
-        check_public_key_hash(key1.public(), key2.public());
+    /// Keys of different algorithms are different keys, and are named differently.
+    #[test]
+    fn keys_of_different_algorithms_are_not_equal() {
+        let ecdsa =
+            EcdsaPrivateKey::from_pkcs8(ecdsa::P256_PK8_1, SignatureScheme::EcdsaSha2NistP256)
+                .unwrap();
+        let rsa = RsaPrivateKey::from_pkcs8(rsa::PK8_1, SignatureScheme::RsassaPssSha256).unwrap();
+
+        assert_ne!(ecdsa.public(), rsa.public());
+        assert_ne!(ecdsa.public().key_id(), rsa.public().key_id());
+        check_public_key_hash(ecdsa.public(), rsa.public());
+    }
+
+    /// A key whose scheme this crate cannot use is still a key whose material it can read and
+    /// write, because the key type is what says what that material looks like. Such a key simply
+    /// cannot verify anything.
+    #[test]
+    fn a_key_with_an_unusable_scheme_still_round_trips() {
+        let plain = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
+
+        for scheme in [
+            // A scheme belonging to a different kind of key entirely...
+            SignatureScheme::EcdsaSha2NistP256,
+            // ... and one this crate has simply not implemented.
+            SignatureScheme::Unknown("ed25519ph".into()),
+        ] {
+            let key =
+                PublicKey::new(KeyType::Ed25519, scheme, ed25519::PUBLIC_KEY.to_vec()).unwrap();
+
+            // It is named, and written out, exactly like the ed25519 key that it is.
+            assert_eq!(key.key_id(), plain.key_id());
+            assert_eq!(key.to_pem().unwrap(), plain.to_pem().unwrap());
+
+            // ... but it cannot check a signature.
+            assert_matches!(
+                key.verify(
+                    &MetadataPath::root(),
+                    b"test",
+                    &Signature {
+                        key_id: key.key_id().clone(),
+                        value: SignatureValue(b"sig".to_vec()),
+                    }
+                ),
+                Err(Error::IllegalArgument(_)) | Err(Error::UnknownSignatureScheme(_))
+            );
+        }
     }
 }
