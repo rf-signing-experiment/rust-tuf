@@ -1,7 +1,7 @@
 //! The `verify` module performs signature verification.
 
 use log::{debug, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::crypto::{KeyId, PublicKey, Signature};
 use crate::error::Error;
@@ -113,12 +113,27 @@ where
         .map(|sig| (sig.key_id(), sig))
         .collect::<HashMap<&KeyId, &Signature>>();
 
+    // Deduplicating by key id is not enough. A key id only names a key, and nothing stops
+    // metadata from giving one key several names, so a single private key could otherwise sign
+    // once under each name and meet a threshold on its own. The spec puts it directly: "When
+    // computing the THRESHOLD each KEY MUST only contribute one SIGNATURE". Count the keys that
+    // signed, rather than the names they signed under.
+    let mut keys_that_signed: HashSet<&[u8]> = HashSet::new();
+
     for (key_id, sig) in signatures {
         match authorized_keys.get(key_id) {
             Some(pub_key) => match pub_key.verify(role, &signing_input, sig) {
                 Ok(()) => {
-                    debug!("Good signature from key ID {:?}", pub_key.key_id());
-                    signatures_needed -= 1;
+                    if keys_that_signed.insert(pub_key.as_bytes()) {
+                        debug!("Good signature from key ID {:?}", pub_key.key_id());
+                        signatures_needed -= 1;
+                    } else {
+                        warn!(
+                            "Key ID {:?} is another name for a key that has already signed; it \
+                             does not count towards the threshold again.",
+                            key_id,
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!("Bad signature from key ID {:?}: {:?}", pub_key.key_id(), e);
@@ -148,4 +163,85 @@ where
     let verified_metadata = D::from_raw_data(&signed)?;
 
     Ok(Verified::new(verified_metadata))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::crypto::{Ed25519PrivateKey, PrivateKey};
+    use crate::metadata::{RawSignedMetadata, SnapshotMetadata, SnapshotMetadataBuilder};
+    use crate::pouf::Pouf1;
+    use assert_matches::assert_matches;
+    use std::str::FromStr;
+
+    const ED25519_1_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.pk8.der");
+
+    /// Give one key two names, and label the signature it produced under both of them.
+    fn signed_twice_under_two_names(
+        key: &Ed25519PrivateKey,
+        first: &KeyId,
+        second: &KeyId,
+    ) -> RawSignedMetadata<Pouf1, SnapshotMetadata> {
+        let raw = SnapshotMetadataBuilder::new()
+            .signed::<Pouf1>(key)
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_slice(raw.as_bytes()).unwrap();
+        let sig = doc["signatures"][0].clone();
+
+        let mut a = sig.clone();
+        a["keyid"] = serde_json::json!(first.to_string());
+        let mut b = sig;
+        b["keyid"] = serde_json::json!(second.to_string());
+        doc["signatures"] = serde_json::json!([a, b]);
+
+        RawSignedMetadata::new(serde_json::to_vec(&doc).unwrap())
+    }
+
+    /// A key id names a key; it does not make one. Since metadata is free to call a key whatever
+    /// it likes, one key may appear under several names, and must still only count once towards a
+    /// threshold.
+    #[test]
+    fn one_key_under_two_names_counts_once() {
+        let key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
+
+        let first =
+            KeyId::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let second =
+            KeyId::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .unwrap();
+
+        let raw = signed_twice_under_two_names(&key, &first, &second);
+        let under_first = key.public().clone().with_key_id(first);
+        let under_second = key.public().clone().with_key_id(second);
+
+        // One signature from one key is still one signature, however it is labelled ...
+        assert_matches!(
+            verify_signatures(
+                &MetadataPath::snapshot(),
+                &raw,
+                2,
+                vec![&under_first, &under_second],
+            ),
+            Err(Error::MetadataMissingSignatures {
+                number_of_valid_signatures: 1,
+                threshold: 2,
+                ..
+            })
+        );
+
+        // ... and it does meet a threshold of one.
+        assert_matches!(
+            verify_signatures(
+                &MetadataPath::snapshot(),
+                &raw,
+                1,
+                vec![&under_first, &under_second],
+            ),
+            Ok(_)
+        );
+    }
 }
