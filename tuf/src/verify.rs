@@ -160,7 +160,7 @@ where
     }
 
     // Everything looks good so deserialize the metadata.
-    let verified_metadata = D::from_raw_data(&signed)?;
+    let verified_metadata = M::from_raw_data::<D>(&signed)?;
 
     Ok(Verified::new(verified_metadata))
 }

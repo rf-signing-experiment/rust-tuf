@@ -2,12 +2,12 @@ use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 use std::collections::BTreeMap;
 
+use data_encoding::HEXLOWER;
+
 use crate::Result;
-use crate::crypto::Signature;
+use crate::crypto::{KeyType, PublicKey, Signature, SignatureScheme};
 use crate::error::Error;
 use crate::pouf::{Pouf, SignedDocument, SignedDocumentOwned};
-
-pub(crate) mod shims;
 
 /// TUF POUF-1 implementation.
 ///
@@ -275,6 +275,43 @@ impl Pouf for Pouf1 {
 
         Ok((document.signatures, document.signed))
     }
+
+    /// Write an ed25519 key as its hex encoded raw bytes.
+    fn encode_public_key(public_key: &PublicKey) -> Result<String> {
+        match public_key.typ() {
+            KeyType::Ed25519 => Ok(HEXLOWER.encode(public_key.as_bytes())),
+            // This crate has no idea how a key type it does not understand is spelled, so the
+            // value is handed back exactly as it was read.
+            KeyType::Unknown(_) => std::str::from_utf8(public_key.as_bytes())
+                .map(|public| public.to_string())
+                .map_err(|err| {
+                    Error::Encoding(format!(
+                        "public key of unknown key type {} is not a string: {}",
+                        public_key.typ(),
+                        err,
+                    ))
+                }),
+        }
+    }
+
+    fn decode_public_key(
+        key_type: KeyType,
+        scheme: SignatureScheme,
+        public: &str,
+    ) -> Result<PublicKey> {
+        match key_type {
+            KeyType::Ed25519 => {
+                let bytes = HEXLOWER.decode(public.as_bytes()).map_err(|err| {
+                    Error::Encoding(format!("could not parse public key as hex: {}", err))
+                })?;
+
+                PublicKey::new(key_type, scheme, bytes)
+            }
+            // Keep it as it was written, so that metadata carrying key types this crate cannot
+            // use is still readable, and still round trips.
+            KeyType::Unknown(_) => PublicKey::new(key_type, scheme, public.as_bytes().to_vec()),
+        }
+    }
 }
 
 fn canonicalize(jsn: &serde_json::Value) -> std::result::Result<Vec<u8>, String> {
@@ -396,6 +433,57 @@ fn convert(jsn: &serde_json::Value) -> std::result::Result<Value, String> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::crypto::{Ed25519PrivateKey, PrivateKey, PublicKey};
+    use assert_matches::assert_matches;
+
+    const PK8_1: &[u8] = include_bytes!("../../../tests/ed25519/ed25519-1.pk8.der");
+
+    #[test]
+    fn ed25519_public_keys_are_hex() {
+        let key = Ed25519PrivateKey::from_pkcs8(PK8_1).unwrap();
+        let public_key = key.public();
+
+        let encoded = Pouf1::encode_public_key(public_key).unwrap();
+        assert_eq!(encoded, HEXLOWER.encode(public_key.as_bytes()));
+
+        let decoded =
+            Pouf1::decode_public_key(KeyType::Ed25519, SignatureScheme::Ed25519, &encoded).unwrap();
+
+        assert_eq!(&decoded, public_key);
+        assert_eq!(decoded.key_id(), public_key.key_id());
+    }
+
+    /// A key type this crate does not understand is left exactly as it was written, because this
+    /// crate has no idea what it is looking at.
+    #[test]
+    fn unknown_public_keys_are_left_alone() {
+        let key_type = KeyType::Unknown("unknown-keytype".into());
+        let scheme = SignatureScheme::Unknown("unknown-scheme".into());
+        let public_key =
+            PublicKey::new(key_type.clone(), scheme.clone(), b"unknown-key".to_vec()).unwrap();
+
+        let encoded = Pouf1::encode_public_key(&public_key).unwrap();
+        assert_eq!(encoded, "unknown-key");
+
+        assert_eq!(
+            Pouf1::decode_public_key(key_type, scheme, &encoded).unwrap(),
+            public_key,
+        );
+    }
+
+    #[test]
+    fn decoding_an_ed25519_public_key_that_is_not_hex_fails() {
+        let key = Ed25519PrivateKey::from_pkcs8(PK8_1).unwrap();
+
+        assert_matches!(
+            Pouf1::decode_public_key(
+                KeyType::Ed25519,
+                SignatureScheme::Ed25519,
+                &key.public().to_pem().unwrap(),
+            ),
+            Err(Error::Encoding(_))
+        );
+    }
 
     #[test]
     fn write_str() {

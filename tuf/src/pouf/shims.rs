@@ -3,12 +3,13 @@ use {
         Result, crypto,
         error::Error,
         metadata::{self, Metadata},
+        pouf::Pouf,
     },
     chrono::{offset::Utc, prelude::*},
     semver::Version,
     serde::{Deserialize, Serialize},
     std::{
-        collections::{BTreeMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         marker::PhantomData,
     },
 };
@@ -33,6 +34,68 @@ fn valid_spec_version(version_string: &str) -> bool {
     };
 
     version.major == SPEC_VERSION.major && version.minor == SPEC_VERSION.minor
+}
+
+/// A public key, with its value written the way `D` writes public keys.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublicKey {
+    keytype: crypto::KeyType,
+    scheme: crypto::SignatureScheme,
+    keyval: PublicKeyValue,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PublicKeyValue {
+    public: String,
+}
+
+impl PublicKey {
+    fn encode<D: Pouf>(key: &crypto::PublicKey) -> Result<Self> {
+        Ok(PublicKey {
+            keytype: key.typ().clone(),
+            scheme: key.scheme().clone(),
+            keyval: PublicKeyValue {
+                public: D::encode_public_key(key)?,
+            },
+        })
+    }
+
+    fn decode<D: Pouf>(self) -> Result<crypto::PublicKey> {
+        if self.keytype == crypto::KeyType::Ed25519
+            && self.scheme != crypto::SignatureScheme::Ed25519
+        {
+            return Err(Error::Encoding(format!(
+                "ed25519 key type must be used with the ed25519 signature scheme, not {:?}",
+                self.scheme,
+            )));
+        }
+
+        D::decode_public_key(self.keytype, self.scheme, &self.keyval.public)
+    }
+}
+
+/// Write out each key the way `D` writes public keys.
+fn encode_keys<D: Pouf>(
+    keys: &HashMap<crypto::KeyId, crypto::PublicKey>,
+) -> Result<BTreeMap<crypto::KeyId, PublicKey>> {
+    keys.iter()
+        .map(|(key_id, key)| Ok((key_id.clone(), PublicKey::encode::<D>(key)?)))
+        .collect()
+}
+
+/// Read each key back out of the way `D` writes public keys, naming it the way this metadata
+/// named it.
+///
+/// Key ids are opaque identifiers, so a key is called whatever the metadata that carries it says
+/// it is called, rather than whatever this crate would have derived from the key material. The
+/// mapping is only as trustworthy as the metadata it was read from, which is why it is not
+/// consulted until the metadata's signatures have been verified.
+fn decode_keys<D: Pouf>(
+    keys: BTreeMap<crypto::KeyId, PublicKey>,
+) -> Result<HashMap<crypto::KeyId, crypto::PublicKey>> {
+    keys.into_iter()
+        .map(|(key_id, key)| Ok((key_id.clone(), key.decode::<D>()?.with_key_id(key_id))))
+        .collect()
 }
 
 fn parse_datetime(ts: &str) -> Result<DateTime<Utc>> {
@@ -62,25 +125,21 @@ pub struct RootMetadata {
     consistent_snapshot: bool,
     expires: String,
     #[serde(deserialize_with = "deserialize_reject_duplicates::deserialize")]
-    keys: BTreeMap<crypto::KeyId, crypto::PublicKey>,
+    keys: BTreeMap<crypto::KeyId, PublicKey>,
     roles: RoleDefinitions,
     #[serde(flatten)]
     additional_fields: BTreeMap<String, serde_json::Value>,
 }
 
 impl RootMetadata {
-    pub fn from(meta: &metadata::RootMetadata) -> Result<Self> {
+    pub fn from_metadata<D: Pouf>(meta: &metadata::RootMetadata) -> Result<Self> {
         Ok(RootMetadata {
             typ: metadata::Role::Root,
             spec_version: SPEC_VERSION.to_string(),
             version: meta.version(),
             expires: format_datetime(meta.expires()),
             consistent_snapshot: meta.consistent_snapshot(),
-            keys: meta
-                .keys()
-                .iter()
-                .map(|(id, key)| (id.clone(), key.clone()))
-                .collect(),
+            keys: encode_keys::<D>(meta.keys())?,
             roles: RoleDefinitions {
                 root: meta.root().clone(),
                 snapshot: meta.snapshot().clone(),
@@ -91,7 +150,7 @@ impl RootMetadata {
         })
     }
 
-    pub fn try_into(self) -> Result<metadata::RootMetadata> {
+    pub fn try_into_metadata<D: Pouf>(self) -> Result<metadata::RootMetadata> {
         if self.typ != metadata::Role::Root {
             return Err(Error::Encoding(format!(
                 "Attempted to decode root metadata labeled as {:?}",
@@ -106,21 +165,11 @@ impl RootMetadata {
             )));
         }
 
-        // A key is called whatever the metadata that carries it says it is called, rather than
-        // whatever this crate would have derived from the key material. Key ids are opaque, so
-        // there is nothing to check them against, and metadata written by another implementation
-        // is read as written rather than partially discarded.
-        let keys = self
-            .keys
-            .into_iter()
-            .map(|(key_id, key)| (key_id.clone(), key.with_key_id(key_id)))
-            .collect();
-
         metadata::RootMetadata::new(
             self.version,
             parse_datetime(&self.expires)?,
             self.consistent_snapshot,
-            keys,
+            decode_keys::<D>(self.keys)?,
             self.roles.root,
             self.roles.snapshot,
             self.roles.targets,
@@ -314,14 +363,14 @@ pub struct TargetsMetadata {
     version: u32,
     expires: String,
     targets: BTreeMap<metadata::TargetPath, metadata::TargetDescription>,
-    #[serde(default, skip_serializing_if = "metadata::Delegations::is_empty")]
-    delegations: metadata::Delegations,
+    #[serde(default, skip_serializing_if = "Delegations::is_empty")]
+    delegations: Delegations,
     #[serde(flatten)]
     additional_fields: BTreeMap<String, serde_json::Value>,
 }
 
 impl TargetsMetadata {
-    pub fn from(metadata: &metadata::TargetsMetadata) -> Result<Self> {
+    pub fn from_metadata<D: Pouf>(metadata: &metadata::TargetsMetadata) -> Result<Self> {
         Ok(TargetsMetadata {
             typ: metadata::Role::Targets,
             spec_version: SPEC_VERSION.to_string(),
@@ -332,7 +381,7 @@ impl TargetsMetadata {
                 .iter()
                 .map(|(p, d)| (p.clone(), d.clone()))
                 .collect(),
-            delegations: metadata.delegations().clone(),
+            delegations: Delegations::from_metadata::<D>(metadata.delegations())?,
             additional_fields: metadata
                 .additional_fields()
                 .iter()
@@ -341,7 +390,7 @@ impl TargetsMetadata {
         })
     }
 
-    pub fn try_into(self) -> Result<metadata::TargetsMetadata> {
+    pub fn try_into_metadata<D: Pouf>(self) -> Result<metadata::TargetsMetadata> {
         if self.typ != metadata::Role::Targets {
             return Err(Error::Encoding(format!(
                 "Attempted to decode targets metadata labeled as {:?}",
@@ -360,51 +409,13 @@ impl TargetsMetadata {
             self.version,
             parse_datetime(&self.expires)?,
             self.targets.into_iter().collect(),
-            self.delegations,
+            self.delegations.try_into_metadata::<D>()?,
             self.additional_fields.into_iter().collect(),
         )
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct PublicKey {
-    keytype: crypto::KeyType,
-    scheme: crypto::SignatureScheme,
-    keyval: PublicKeyValue,
-}
-
-impl PublicKey {
-    pub fn new(
-        keytype: crypto::KeyType,
-        scheme: crypto::SignatureScheme,
-        public_key: String,
-    ) -> Self {
-        PublicKey {
-            keytype,
-            scheme,
-            keyval: PublicKeyValue { public: public_key },
-        }
-    }
-
-    pub fn public_key(&self) -> &str {
-        &self.keyval.public
-    }
-
-    pub fn scheme(&self) -> &crypto::SignatureScheme {
-        &self.scheme
-    }
-
-    pub fn keytype(&self) -> &crypto::KeyType {
-        &self.keytype
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct PublicKeyValue {
-    public: String,
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Delegation {
     name: metadata::MetadataPath,
     terminating: bool,
@@ -468,15 +479,15 @@ impl TryFrom<Delegation> for metadata::Delegation {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Delegations {
     #[serde(deserialize_with = "deserialize_reject_duplicates::deserialize")]
-    keys: BTreeMap<crypto::KeyId, crypto::PublicKey>,
+    keys: BTreeMap<crypto::KeyId, PublicKey>,
     roles: Vec<Delegation>,
 }
 
-impl From<&metadata::Delegations> for Delegations {
-    fn from(delegations: &metadata::Delegations) -> Delegations {
+impl Delegations {
+    pub fn from_metadata<D: Pouf>(delegations: &metadata::Delegations) -> Result<Self> {
         let mut roles = delegations
             .roles()
             .iter()
@@ -486,29 +497,24 @@ impl From<&metadata::Delegations> for Delegations {
         // We want our roles in a consistent order.
         roles.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
 
-        Delegations {
-            keys: delegations
-                .keys()
-                .iter()
-                .map(|(id, key)| (id.clone(), key.clone()))
-                .collect(),
+        Ok(Delegations {
+            keys: encode_keys::<D>(delegations.keys())?,
             roles,
-        }
+        })
     }
-}
 
-impl TryFrom<Delegations> for metadata::Delegations {
-    type Error = Error;
-
-    fn try_from(delegations: Delegations) -> Result<metadata::Delegations> {
+    pub fn try_into_metadata<D: Pouf>(self) -> Result<metadata::Delegations> {
         metadata::Delegations::new(
-            delegations.keys.into_iter().collect(),
-            delegations
-                .roles
+            decode_keys::<D>(self.keys)?,
+            self.roles
                 .into_iter()
                 .map(|delegation| delegation.try_into())
                 .collect::<Result<Vec<_>>>()?,
         )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.roles.is_empty()
     }
 }
 

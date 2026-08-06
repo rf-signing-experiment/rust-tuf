@@ -9,14 +9,15 @@ use {
         rand::SystemRandom,
         signature::{ED25519, Ed25519KeyPair, KeyPair},
     },
-    serde::{
-        Deserialize, Deserializer, Serialize, Serializer, de::Error as DeserializeError,
-        ser::Error as SerializeError,
-    },
+    serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeserializeError},
     spki::{
         AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicKeyInfoOwned,
         SubjectPublicKeyInfoRef,
-        der::{Decode as _, Encode as _, asn1::BitString},
+        der::{
+            Decode as _, Encode as _,
+            asn1::BitString,
+            pem::{self, LineEnding, PemLabel as _},
+        },
     },
     std::{
         cmp::Ordering,
@@ -28,12 +29,15 @@ use {
 
 use crate::error::{Error, Result};
 use crate::metadata::MetadataPath;
-use crate::pouf::pouf1::shims;
 
 const HASH_ALG_PREFS: &[HashAlgorithm] = &[HashAlgorithm::Sha512, HashAlgorithm::Sha256];
 
 /// `id-Ed25519` as defined in [RFC 8410](https://datatracker.ietf.org/doc/html/rfc8410).
 const ED25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
+
+/// The PEM label public keys are written with, per
+/// [RFC 7468](https://datatracker.ietf.org/doc/html/rfc7468#section-13).
+pub(crate) const PUBLIC_KEY_PEM_LABEL: &str = SubjectPublicKeyInfoRef::PEM_LABEL;
 
 /// The length of an ed25519 private key in bytes
 const ED25519_PRIVATE_KEY_LENGTH: usize = 32;
@@ -43,6 +47,14 @@ const ED25519_PUBLIC_KEY_LENGTH: usize = 32;
 
 /// The length of an ed25519 keypair in bytes
 const ED25519_KEYPAIR_LENGTH: usize = ED25519_PRIVATE_KEY_LENGTH + ED25519_PUBLIC_KEY_LENGTH;
+
+fn spki_error(err: impl Display) -> Error {
+    Error::Encoding(format!("SPKI: {}", err))
+}
+
+fn pem_error(err: impl Display) -> Error {
+    Error::Encoding(format!("PEM: {}", err))
+}
 
 /// Given a map of hash algorithms and their values and retains the supported
 /// hashes. Returns an `Err` if there is no match.
@@ -173,43 +185,15 @@ where
     Ok((size, hashes))
 }
 
-fn shim_public_key(
-    key_type: &KeyType,
-    signature_scheme: &SignatureScheme,
-    public_key: &[u8],
-) -> Result<shims::PublicKey> {
-    let key = match (key_type, signature_scheme) {
-        (KeyType::Ed25519, SignatureScheme::Ed25519) => HEXLOWER.encode(public_key),
-        (_, _) => {
-            // We don't understand this key type and/or signature scheme, so we left it as a UTF-8 string.
-            std::str::from_utf8(public_key)
-                .map_err(|err| {
-                    Error::Encoding(format!(
-                        "error converting public key value {:?} with key \
-                        type {:?} and signature scheme {:?} to a string: {:?}",
-                        public_key, key_type, signature_scheme, err
-                    ))
-                })?
-                .to_string()
-        }
-    };
-
-    Ok(shims::PublicKey::new(
-        key_type.clone(),
-        signature_scheme.clone(),
-        key,
-    ))
-}
-
 /// Derive a key id from the key material itself.
 ///
 /// This is the SHA-256 digest of the key's `SubjectPublicKeyInfo`, which is the same fingerprint
 /// [RFC 7469](https://datatracker.ietf.org/doc/html/rfc7469#section-2.4) defines. Key types this
-/// crate cannot write a `SubjectPublicKeyInfo` for are digested as they stand.
+/// crate cannot write a `SubjectPublicKeyInfo` for are digested as-is.
 fn calculate_key_id(key_type: &KeyType, public_key: &[u8]) -> Result<KeyId> {
-    let bytes = match key_type {
-        KeyType::Ed25519 => write_spki(public_key, key_type)?,
-        KeyType::Unknown(_) => public_key.to_vec(),
+    let bytes = match key_type.oid() {
+        Some(_) => write_spki(public_key, key_type)?,
+        None => public_key.to_vec(),
     };
 
     let mut context = digest::Context::new(&SHA256);
@@ -367,6 +351,15 @@ impl KeyType {
             KeyType::Unknown(ref s) => s,
         }
     }
+
+    /// Return the algorithm identifier this key type is written with inside a
+    /// `SubjectPublicKeyInfo`, if this crate knows one.
+    fn oid(&self) -> Option<ObjectIdentifier> {
+        match *self {
+            KeyType::Ed25519 => Some(ED25519_OID),
+            KeyType::Unknown(_) => None,
+        }
+    }
 }
 
 impl Display for KeyType {
@@ -494,7 +487,17 @@ pub struct PublicKey {
 }
 
 impl PublicKey {
-    fn new(typ: KeyType, scheme: SignatureScheme, value: Vec<u8>) -> Result<Self> {
+    /// Create a public key from a key type, a signing scheme, and the key's raw bytes.
+    ///
+    /// The key is named by [deriving a key id](KeyId) from its own bytes. Use
+    /// [`with_key_id`](Self::with_key_id) to name it something else.
+    pub fn new(typ: KeyType, scheme: SignatureScheme, value: Vec<u8>) -> Result<Self> {
+        if typ == KeyType::Ed25519 && value.len() != ED25519_PUBLIC_KEY_LENGTH {
+            return Err(Error::IllegalArgument(
+                "ed25519 keys must be 32 bytes long".into(),
+            ));
+        }
+
         let key_id = calculate_key_id(&typ, &value)?;
         let value = PublicKeyValue(value);
         Ok(PublicKey {
@@ -513,9 +516,7 @@ impl PublicKey {
         self
     }
 
-    /// Parse DER bytes as an SPKI key.
-    ///
-    /// See the documentation on `KeyValue` for more information on SPKI.
+    /// Parse DER bytes as a `SubjectPublicKeyInfo` key.
     pub fn from_spki(der_bytes: &[u8], scheme: SignatureScheme) -> Result<Self> {
         let typ = match scheme {
             SignatureScheme::Ed25519 => KeyType::Ed25519,
@@ -529,23 +530,46 @@ impl PublicKey {
         Self::new(typ, scheme, value)
     }
 
-    /// Parse ED25519 bytes as a public key.
-    pub fn from_ed25519<T: Into<Vec<u8>>>(bytes: T) -> Result<Self> {
-        let bytes = bytes.into();
-        if bytes.len() != 32 {
-            return Err(Error::IllegalArgument(
-                "ed25519 keys must be 32 bytes long".into(),
-            ));
+    /// Parse a PEM encoded `SubjectPublicKeyInfo` key.
+    ///
+    /// Returns [`Error::UnknownKeyType`] for a key type this crate cannot read a
+    /// `SubjectPublicKeyInfo` for.
+    pub fn from_pem(pem: &str, typ: KeyType, scheme: SignatureScheme) -> Result<Self> {
+        if typ.oid().is_none() {
+            return Err(Error::UnknownKeyType(typ.to_string()));
         }
 
-        Self::new(KeyType::Ed25519, SignatureScheme::Ed25519, bytes)
+        let (label, der) = pem::decode_vec(pem.as_bytes()).map_err(pem_error)?;
+
+        if label != PUBLIC_KEY_PEM_LABEL {
+            return Err(Error::Encoding(format!(
+                "PEM: expected a {:?} block, found {:?}",
+                PUBLIC_KEY_PEM_LABEL, label,
+            )));
+        }
+
+        let value = read_spki(&der, &typ)?;
+
+        Self::new(typ, scheme, value)
     }
 
-    /// Write the public key as SPKI DER bytes.
-    ///
-    /// See the documentation on `KeyValue` for more information on SPKI.
+    /// Write the public key as `SubjectPublicKeyInfo` DER bytes.
     pub fn as_spki(&self) -> Result<Vec<u8>> {
         write_spki(&self.value.0, &self.typ)
+    }
+
+    /// Write the public key as a PEM encoded `SubjectPublicKeyInfo`.
+    ///
+    /// Returns [`Error::UnknownKeyType`] for a key type this crate cannot write a
+    /// `SubjectPublicKeyInfo` for.
+    pub fn to_pem(&self) -> Result<String> {
+        pem::encode_string(PUBLIC_KEY_PEM_LABEL, LineEnding::LF, &self.as_spki()?)
+            .map_err(pem_error)
+    }
+
+    /// Parse ED25519 bytes as a public key.
+    pub fn from_ed25519<T: Into<Vec<u8>>>(bytes: T) -> Result<Self> {
+        Self::new(KeyType::Ed25519, SignatureScheme::Ed25519, bytes.into())
     }
 
     /// An immutable reference to the key's type.
@@ -595,64 +619,6 @@ impl PartialOrd for PublicKey {
     }
 }
 
-impl Serialize for PublicKey {
-    fn serialize<S>(&self, ser: S) -> ::std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let key = shim_public_key(&self.typ, &self.scheme, &self.value.0)
-            .map_err(|e| SerializeError::custom(format!("Couldn't write key as SPKI: {:?}", e)))?;
-        key.serialize(ser)
-    }
-}
-
-impl<'de> Deserialize<'de> for PublicKey {
-    fn deserialize<D: Deserializer<'de>>(de: D) -> ::std::result::Result<Self, D::Error> {
-        let intermediate: shims::PublicKey = Deserialize::deserialize(de)?;
-
-        let key = match intermediate.keytype() {
-            KeyType::Ed25519 => {
-                if intermediate.scheme() != &SignatureScheme::Ed25519 {
-                    return Err(DeserializeError::custom(format!(
-                        "ed25519 key type must be used with the ed25519 signature scheme, not {:?}",
-                        intermediate.scheme()
-                    )));
-                }
-
-                let bytes = HEXLOWER
-                    .decode(intermediate.public_key().as_bytes())
-                    .map_err(|e| {
-                        DeserializeError::custom(format!("Couldn't parse key as HEX: {:?}", e))
-                    })?;
-
-                PublicKey::from_ed25519(bytes).map_err(|e| {
-                    DeserializeError::custom(format!("Couldn't parse key as ed25519: {:?}", e))
-                })?
-            }
-            KeyType::Unknown(_) => {
-                // We don't know this key type, so just leave it as a UTF-8 string.
-                PublicKey::new(
-                    intermediate.keytype().clone(),
-                    intermediate.scheme().clone(),
-                    intermediate.public_key().as_bytes().to_vec(),
-                )
-                .map_err(|e| DeserializeError::custom(format!("Couldn't parse key: {:?}", e)))?
-            }
-        };
-
-        if intermediate.keytype() != &key.typ {
-            return Err(DeserializeError::custom(format!(
-                "Key type listed in the metadata did not match the type extrated \
-                 from the key. {:?} vs. {:?}",
-                intermediate.keytype(),
-                key.typ,
-            )));
-        }
-
-        Ok(key)
-    }
-}
-
 #[derive(Clone, PartialEq, Hash, Eq)]
 struct PublicKeyValue(Vec<u8>);
 
@@ -674,6 +640,15 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// Create a new `Signature` from a `KeyId` and a `SignatureValue`.
+    ///
+    /// Note: It is unlikely that you ever want to do this manually. This exists so that
+    /// [Pouf](crate::pouf::Pouf) implementations can reconstruct the signatures they read out of
+    /// their wire format.
+    pub fn new(key_id: KeyId, value: SignatureValue) -> Self {
+        Signature { key_id, value }
+    }
+
     /// An immutable reference to the `KeyId` of the key that produced the signature.
     pub fn key_id(&self) -> &KeyId {
         &self.key_id
@@ -756,12 +731,14 @@ impl Display for HashValue {
     }
 }
 
-fn write_spki(public: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
-    let oid = key_oid(key_type)?;
+/// Write a key's raw bytes as `SubjectPublicKeyInfo` DER bytes.
+pub(crate) fn write_spki(public: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
+    let Some(oid) = key_type.oid() else {
+        return Err(Error::UnknownKeyType(key_type.to_string()));
+    };
 
     let spki = SubjectPublicKeyInfoOwned {
-        // RFC 8410 §3: for the id-Ed25519 algorithm the parameters must be absent. Earlier
-        // versions of this crate wrote an explicit NULL, which `read_spki` still accepts.
+        // RFC 8410 §3: for the id-Ed25519 algorithm the parameters must be absent.
         algorithm: AlgorithmIdentifierOwned {
             oid,
             parameters: None,
@@ -773,8 +750,11 @@ fn write_spki(public: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
 }
 
 /// Read a key's raw bytes out of `SubjectPublicKeyInfo` DER bytes.
-fn read_spki(der_bytes: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
-    let oid = key_oid(key_type)?;
+pub(crate) fn read_spki(der_bytes: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
+    let Some(oid) = key_type.oid() else {
+        return Err(Error::UnknownKeyType(key_type.to_string()));
+    };
+
     let spki = SubjectPublicKeyInfoRef::from_der(der_bytes).map_err(spki_error)?;
 
     if spki.algorithm.oid != oid {
@@ -784,35 +764,13 @@ fn read_spki(der_bytes: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
         )));
     }
 
-    // The algorithm's parameters are not checked, so that a key written by an earlier version of
-    // this crate, which spelled them as an explicit NULL, is still read.
+    // Older versions of this crate wrote out an explicit NULL for the ed25519 algorithm's
+    // parameters, which RFC 8410 §3 says must be absent, so both spellings are accepted here.
 
-    let public = spki
-        .subject_public_key
+    spki.subject_public_key
         .as_bytes()
-        .ok_or_else(|| Error::Encoding("SPKI: public key is not a whole number of bytes".into()))?;
-
-    if key_type == &KeyType::Ed25519 && public.len() != ED25519_PUBLIC_KEY_LENGTH {
-        return Err(Error::Encoding(format!(
-            "SPKI: ed25519 public keys must be {} bytes long, got {}",
-            ED25519_PUBLIC_KEY_LENGTH,
-            public.len(),
-        )));
-    }
-
-    Ok(public.to_vec())
-}
-
-/// The algorithm identifier this key type is written with inside a `SubjectPublicKeyInfo`.
-fn key_oid(key_type: &KeyType) -> Result<ObjectIdentifier> {
-    match key_type {
-        KeyType::Ed25519 => Ok(ED25519_OID),
-        KeyType::Unknown(s) => Err(Error::UnknownKeyType(s.to_owned())),
-    }
-}
-
-fn spki_error(err: impl Display) -> Error {
-    Error::Encoding(format!("SPKI: {}", err))
+        .ok_or_else(|| Error::Encoding("SPKI: public key is not a whole number of bytes".into()))
+        .map(|bytes| bytes.to_vec())
 }
 
 #[cfg(test)]
@@ -835,6 +793,30 @@ mod test {
         let key = PublicKey::from_spki(ed25519::SPKI_1, SignatureScheme::Ed25519).unwrap();
         assert_eq!(key.typ, KeyType::Ed25519);
         assert_eq!(key.scheme, SignatureScheme::Ed25519);
+        assert_eq!(key.as_bytes(), ed25519::PUBLIC_KEY);
+    }
+
+    /// Earlier versions of this crate wrote an explicit NULL for the ed25519 algorithm's
+    /// parameters, which RFC 8410 says must be absent. Keys written that way must still parse.
+    #[test]
+    fn parse_public_ed25519_spki_with_null_parameters() {
+        let mut der = vec![
+            0x30, 0x2c, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x05, 0x00, 0x03, 0x21, 0x00,
+        ];
+        der.extend_from_slice(ed25519::PUBLIC_KEY);
+
+        let key = PublicKey::from_spki(&der, SignatureScheme::Ed25519).unwrap();
+        assert_eq!(key.as_bytes(), ed25519::PUBLIC_KEY);
+
+        // ... but they are rewritten without it.
+        assert_ne!(key.as_spki().unwrap(), der);
+        assert_eq!(
+            key.as_spki().unwrap(),
+            PublicKey::from_ed25519(ed25519::PUBLIC_KEY)
+                .unwrap()
+                .as_spki()
+                .unwrap(),
+        );
     }
 
     #[test]
@@ -847,6 +829,14 @@ mod test {
         );
         assert_eq!(key.typ, KeyType::Ed25519);
         assert_eq!(key.scheme, SignatureScheme::Ed25519);
+    }
+
+    #[test]
+    fn parse_public_ed25519_rejects_the_wrong_length() {
+        assert_matches!(
+            PublicKey::from_ed25519(vec![0; 31]),
+            Err(Error::IllegalArgument(_))
+        );
     }
 
     /// A key that is not named by the metadata that carries it is named by the digest of its
@@ -862,6 +852,18 @@ mod test {
             key.key_id(),
             &KeyId::from_str(&HEXLOWER.encode(context.finish().as_ref())).unwrap(),
         );
+
+        // Reading the same key back out of any encoding names it the same way.
+        assert_eq!(
+            PublicKey::from_pem(
+                &key.to_pem().unwrap(),
+                KeyType::Ed25519,
+                SignatureScheme::Ed25519
+            )
+            .unwrap()
+            .key_id(),
+            key.key_id(),
+        );
     }
 
     /// Key ids are opaque, so metadata is free to call a key whatever it likes.
@@ -871,10 +873,13 @@ mod test {
         let derived = key.key_id().clone();
 
         let legacy = KeyId::from_str("legacy_key_id_that_can_be_an_arbitrary_value").unwrap();
-        let renamed = key.with_key_id(legacy.clone());
+        let renamed = key.clone().with_key_id(legacy.clone());
 
         assert_ne!(derived, legacy);
         assert_eq!(renamed.key_id(), &legacy);
+
+        // It is still the same key, though.
+        assert_eq!(renamed.value, key.value);
     }
 
     #[test]
@@ -1010,45 +1015,32 @@ mod test {
         assert_eq!(encoded, jsn);
     }
 
+    /// There is no `SubjectPublicKeyInfo` this crate can write for a key type it does not
+    /// understand, and inventing one would misrepresent bytes it cannot read.
     #[test]
-    fn serde_unknown_keytype_and_signature_scheme_public_key() {
-        let pub_key = PublicKey::new(
-            KeyType::Unknown("unknown-keytype".into()),
-            SignatureScheme::Unknown("unknown-scheme".into()),
-            b"unknown-key".to_vec(),
-        )
-        .unwrap();
-        let encoded = serde_json::to_value(&pub_key).unwrap();
-        let jsn = json!({
-            "keytype": "unknown-keytype",
-            "scheme": "unknown-scheme",
-            "keyval": {
-                "public": "unknown-key",
-            }
-        });
-        assert_eq!(encoded, jsn);
-        let decoded: PublicKey = serde_json::from_value(jsn).unwrap();
-        assert_eq!(decoded, pub_key);
+    fn pem_rejects_an_unknown_key_type() {
+        let key_type = KeyType::Unknown("unknown-keytype".into());
+        let scheme = SignatureScheme::Unknown("unknown-scheme".into());
+        let pub_key =
+            PublicKey::new(key_type.clone(), scheme.clone(), b"unknown-key".to_vec()).unwrap();
+
+        assert_matches!(pub_key.to_pem(), Err(Error::UnknownKeyType(t)) if t == "unknown-keytype");
+        assert_matches!(
+            PublicKey::from_pem("unknown-key", key_type, scheme),
+            Err(Error::UnknownKeyType(t)) if t == "unknown-keytype"
+        );
     }
 
     #[test]
-    fn serde_ed25519_public_key() {
-        let pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_1)
-            .unwrap()
-            .public()
-            .clone();
-
-        let encoded = serde_json::to_value(&pub_key).unwrap();
-        let jsn = json!({
-            "keytype": "ed25519",
-            "scheme": "ed25519",
-            "keyval": {
-                "public": HEXLOWER.encode(pub_key.as_bytes()),
-            }
-        });
-        assert_eq!(encoded, jsn);
-        let decoded: PublicKey = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded, pub_key);
+    fn from_pem_rejects_a_block_that_is_not_a_public_key() {
+        assert_matches!(
+            PublicKey::from_pem(
+                "-----BEGIN PRIVATE KEY-----\nbG9s\n-----END PRIVATE KEY-----\n",
+                KeyType::Ed25519,
+                SignatureScheme::Ed25519,
+            ),
+            Err(Error::Encoding(_))
+        );
     }
 
     #[test]
