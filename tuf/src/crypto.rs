@@ -22,7 +22,6 @@ use {
         cmp::Ordering,
         collections::HashMap,
         fmt::{self, Debug, Display},
-        hash,
         str::FromStr,
     },
 };
@@ -208,35 +207,31 @@ fn shim_public_key(
     ))
 }
 
-fn calculate_key_id(
-    key_type: &KeyType,
-    signature_scheme: &SignatureScheme,
-    keyid_hash_algorithms: &Option<Vec<String>>,
-    public_key: &[u8],
-) -> Result<KeyId> {
-    use crate::pouf::{Pouf, Pouf1};
+/// Derive a key id from the key material itself.
+///
+/// This is the SHA-256 digest of the key's `SubjectPublicKeyInfo`, which is the same fingerprint
+/// [RFC 7469](https://datatracker.ietf.org/doc/html/rfc7469#section-2.4) defines. Key types this
+/// crate cannot write a `SubjectPublicKeyInfo` for are digested as they stand.
+fn calculate_key_id(key_type: &KeyType, public_key: &[u8]) -> Result<KeyId> {
+    let bytes = match key_type {
+        KeyType::Ed25519 => write_spki(public_key, key_type)?,
+        KeyType::Unknown(_) => public_key.to_vec(),
+    };
 
-    let public_key = shim_public_key(
-        key_type,
-        signature_scheme,
-        keyid_hash_algorithms,
-        public_key,
-    )?;
-    let public_key = Pouf1::signing_input(&Pouf1::to_raw_data(&public_key)?)?;
     let mut context = digest::Context::new(&SHA256);
-    context.update(&public_key);
+    context.update(&bytes);
 
-    let key_id = HEXLOWER.encode(context.finish().as_ref());
-
-    Ok(KeyId(key_id))
+    Ok(KeyId(HEXLOWER.encode(context.finish().as_ref())))
 }
 
-/// Wrapper type for public key's ID.
+/// Wrapper type for a public key's ID.
 ///
-/// # Calculating
+/// A key id is an opaque identifier that names a key within some metadata. Nothing may be
+/// inferred from its contents: two repositories are free to identify the same key differently,
+/// and a key id read out of metadata is preserved exactly as it was written.
 ///
-/// A `KeyId` is calculated as the hex digest of the SHA-256 hash of the
-/// canonical form of the public key, or `hexdigest(sha256(cjson(public_key)))`.
+/// If this library needs to calculate a new key id, it uses a SHA-256 digest of the
+/// key's `SubjectPublicKeyInfo`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyId(String);
 
@@ -245,10 +240,8 @@ impl FromStr for KeyId {
 
     /// Parse a key ID from a string.
     fn from_str(string: &str) -> Result<Self> {
-        if string.len() != 64 {
-            return Err(Error::IllegalArgument(
-                "key ID must be 64 characters long".into(),
-            ));
+        if string.is_empty() {
+            return Err(Error::IllegalArgument("key ID must not be empty".into()));
         }
         Ok(KeyId(string.to_owned()))
     }
@@ -523,7 +516,7 @@ impl PrivateKey for Ed25519PrivateKey {
 }
 
 /// A structure containing information about a public key.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PublicKey {
     typ: KeyType,
     key_id: KeyId,
@@ -539,7 +532,7 @@ impl PublicKey {
         keyid_hash_algorithms: Option<Vec<String>>,
         value: Vec<u8>,
     ) -> Result<Self> {
-        let key_id = calculate_key_id(&typ, &scheme, &keyid_hash_algorithms, &value)?;
+        let key_id = calculate_key_id(&typ, &value)?;
         let value = PublicKeyValue(value);
         Ok(PublicKey {
             typ,
@@ -548,6 +541,14 @@ impl PublicKey {
             keyid_hash_algorithms,
             value,
         })
+    }
+
+    /// Name this key with the given key id.
+    ///
+    /// Key ids are opaque, so metadata is free to identify a key however it likes.
+    pub fn with_key_id(mut self, key_id: KeyId) -> Self {
+        self.key_id = key_id;
+        self
     }
 
     /// Parse DER bytes as an SPKI key.
@@ -648,18 +649,6 @@ impl PublicKey {
     }
 }
 
-impl PartialEq for PublicKey {
-    fn eq(&self, other: &Self) -> bool {
-        // key_id is derived from these fields, so we ignore it.
-        self.typ == other.typ
-            && self.scheme == other.scheme
-            && self.keyid_hash_algorithms == other.keyid_hash_algorithms
-            && self.value == other.value
-    }
-}
-
-impl Eq for PublicKey {}
-
 impl Ord for PublicKey {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key_id.cmp(&other.key_id)
@@ -669,16 +658,6 @@ impl Ord for PublicKey {
 impl PartialOrd for PublicKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-impl hash::Hash for PublicKey {
-    fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        // key_id is derived from these fields, so we ignore it.
-        self.typ.hash(state);
-        self.scheme.hash(state);
-        self.keyid_hash_algorithms.hash(state);
-        self.value.hash(state);
     }
 }
 
@@ -939,40 +918,54 @@ mod test {
         let key = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
         assert_eq!(
             key.key_id(),
-            &KeyId::from_str("e0294a3f17cc8563c3ed5fceb3bd8d3f6bfeeaca499b5c9572729ae015566554")
+            &KeyId::from_str("061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f")
                 .unwrap()
         );
         assert_eq!(key.typ, KeyType::Ed25519);
         assert_eq!(key.scheme, SignatureScheme::Ed25519);
     }
 
+    /// A key that is not named by the metadata that carries it is named by the digest of its
+    /// `SubjectPublicKeyInfo`.
     #[test]
-    fn parse_public_ed25519_without_keyid_hash_algo() {
-        let key =
-            PublicKey::from_ed25519_with_keyid_hash_algorithms(ed25519::PUBLIC_KEY, None).unwrap();
+    fn key_id_is_derived_from_the_key_material() {
+        let key = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
+
+        let mut context = digest::Context::new(&SHA256);
+        context.update(&key.as_spki().unwrap());
+
         assert_eq!(
             key.key_id(),
-            &KeyId::from_str("e0294a3f17cc8563c3ed5fceb3bd8d3f6bfeeaca499b5c9572729ae015566554")
-                .unwrap()
+            &KeyId::from_str(&HEXLOWER.encode(context.finish().as_ref())).unwrap(),
         );
-        assert_eq!(key.typ, KeyType::Ed25519);
-        assert_eq!(key.scheme, SignatureScheme::Ed25519);
     }
 
+    /// Key ids are opaque, so metadata is free to call a key whatever it likes.
     #[test]
-    fn parse_public_ed25519_with_keyid_hash_algo() {
-        let key = PublicKey::from_ed25519_with_keyid_hash_algorithms(
+    fn key_id_can_be_overridden() {
+        let key = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
+        let derived = key.key_id().clone();
+
+        let legacy = KeyId::from_str("legacy_key_id_that_can_be_an_arbitrary_value").unwrap();
+        let renamed = key.with_key_id(legacy.clone());
+
+        assert_ne!(derived, legacy);
+        assert_eq!(renamed.key_id(), &legacy);
+    }
+
+    /// `keyid_hash_algorithms` used to feed the key id, so the same key carried two names
+    /// depending on whether it was set. It names nothing now.
+    #[test]
+    fn keyid_hash_algorithms_do_not_name_a_key() {
+        let without =
+            PublicKey::from_ed25519_with_keyid_hash_algorithms(ed25519::PUBLIC_KEY, None).unwrap();
+        let with = PublicKey::from_ed25519_with_keyid_hash_algorithms(
             ed25519::PUBLIC_KEY,
             python_tuf_compatibility_keyid_hash_algorithms(),
         )
         .unwrap();
-        assert_eq!(
-            key.key_id(),
-            &KeyId::from_str("a9f3ebc9b138762563a9c27b6edd439959e559709babd123e8d449ba2c18c61a")
-                .unwrap(),
-        );
-        assert_eq!(key.typ, KeyType::Ed25519);
-        assert_eq!(key.scheme, SignatureScheme::Ed25519);
+
+        assert_eq!(without.key_id(), with.key_id());
     }
 
     #[test]
@@ -1252,7 +1245,7 @@ mod test {
         let sig = key.sign(msg).unwrap();
         let encoded = serde_json::to_value(&sig).unwrap();
         let jsn = json!({
-            "keyid": "a9f3ebc9b138762563a9c27b6edd439959e559709babd123e8d449ba2c18c61a",
+            "keyid": key.public().key_id().to_string(),
             "sig": "fe4d13b2a73c033a1de7f5107b205fc7ba0e1566cb95b92349cae6aa453\
                 8956013bfe0f7bf977cb072bb65e8782b5f33a0573fe78816299a017ca5ba55\
                 9e390c",
@@ -1271,7 +1264,7 @@ mod test {
         let sig = key.sign(msg).unwrap();
         let encoded = serde_json::to_value(&sig).unwrap();
         let jsn = json!({
-            "keyid": "e0294a3f17cc8563c3ed5fceb3bd8d3f6bfeeaca499b5c9572729ae015566554",
+            "keyid": key.public().key_id().to_string(),
             "sig": "fe4d13b2a73c033a1de7f5107b205fc7ba0e1566cb95b92349cae6aa453\
                     8956013bfe0f7bf977cb072bb65e8782b5f33a0573fe78816299a017ca5ba55\
                     9e390c",
