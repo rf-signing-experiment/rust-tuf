@@ -4,8 +4,8 @@ use chrono::offset::Utc;
 use chrono::{DateTime, Duration};
 use futures_io::AsyncRead;
 use serde::{
-    Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned,
-    de::Error as DeserializeError, ser::Error as SerializeError,
+    Deserialize, Deserializer, Serialize, Serializer, de::Error as DeserializeError,
+    ser::Error as SerializeError,
 };
 use std::borrow::{Borrow, Cow};
 use std::collections::{HashMap, HashSet};
@@ -18,7 +18,7 @@ use crate::Result;
 use crate::crypto::{self, HashAlgorithm, HashValue, KeyId, PrivateKey, PublicKey, Signature};
 use crate::error::Error;
 use crate::pouf::Pouf;
-use crate::pouf::pouf1::shims;
+use crate::pouf::shims;
 
 #[rustfmt::skip]
 static PATH_ILLEGAL_COMPONENTS: &[&str] = &[
@@ -305,7 +305,7 @@ impl From<MetadataThreshold> for u32 {
 }
 
 /// Top level trait used for role metadata.
-pub trait Metadata: Debug + PartialEq + Serialize + DeserializeOwned {
+pub trait Metadata: Debug + PartialEq + Sized {
     /// The role associated with the metadata.
     const ROLE: Role;
 
@@ -314,6 +314,15 @@ pub trait Metadata: Debug + PartialEq + Serialize + DeserializeOwned {
 
     /// An immutable reference to the metadata's expiration `DateTime`.
     fn expires(&self) -> &DateTime<Utc>;
+
+    /// Write this metadata out as `D`'s raw data.
+    ///
+    /// Metadata is written by whichever pouf is carrying it, because a pouf decides things like
+    /// how the public keys inside the metadata are spelled.
+    fn to_raw_data<D: Pouf>(&self) -> Result<D::RawData>;
+
+    /// Read this metadata back out of `D`'s raw data.
+    fn from_raw_data<D: Pouf>(raw_data: &D::RawData) -> Result<Self>;
 }
 
 /// Unverified raw metadata with attached signatures and type information identifying the
@@ -463,14 +472,14 @@ where
 {
     /// Create a new `SignedMetadataBuilder` from a given `Metadata`.
     pub fn from_metadata(metadata: &M) -> Result<Self> {
-        let metadata = D::to_raw_data(metadata)?;
+        let metadata = metadata.to_raw_data::<D>()?;
         Self::from_raw_metadata(metadata)
     }
 
     /// Create a new `SignedMetadataBuilder` from manually serialized metadata to be signed.
     /// Returns an error if `metadata` cannot be parsed into `M`.
     pub fn from_raw_metadata(metadata: D::RawData) -> Result<Self> {
-        let _ensure_metadata_parses: M = D::from_raw_data(&metadata)?;
+        let _ensure_metadata_parses = M::from_raw_data::<D>(&metadata)?;
         let metadata_bytes = D::signing_input(&metadata)?;
         Ok(Self {
             signatures: HashMap::new(),
@@ -541,7 +550,7 @@ where
     /// SignedMetadata::<Pouf1, _>::new(&snapshot, &key).unwrap();
     /// ```
     pub fn new(metadata: &M, private_key: &dyn PrivateKey) -> Result<Self> {
-        let raw = D::to_raw_data(metadata)?;
+        let raw = metadata.to_raw_data::<D>()?;
         let bytes = D::signing_input(&raw)?;
         let sig = private_key.sign(&bytes)?;
         Ok(Self {
@@ -661,7 +670,7 @@ where
     ///
     /// This operation is not safe to do with metadata obtained from an untrusted source.
     pub fn assume_valid(&self) -> Result<M> {
-        D::from_raw_data(&self.metadata)
+        M::from_raw_data::<D>(&self.metadata)
     }
 }
 
@@ -947,25 +956,12 @@ impl Metadata for RootMetadata {
     fn expires(&self) -> &DateTime<Utc> {
         &self.expires
     }
-}
-
-impl Serialize for RootMetadata {
-    fn serialize<S>(&self, ser: S) -> ::std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let m = shims::RootMetadata::from(self)
-            .map_err(|e| SerializeError::custom(format!("{:?}", e)))?;
-        m.serialize(ser)
+    fn to_raw_data<D: Pouf>(&self) -> Result<D::RawData> {
+        D::to_raw_data(&shims::RootMetadata::from_metadata::<D>(self)?)
     }
-}
 
-impl<'de> Deserialize<'de> for RootMetadata {
-    fn deserialize<D: Deserializer<'de>>(de: D) -> ::std::result::Result<Self, D::Error> {
-        let intermediate: shims::RootMetadata = Deserialize::deserialize(de)?;
-        intermediate
-            .try_into()
-            .map_err(|e| DeserializeError::custom(format!("{:?}", e)))
+    fn from_raw_data<D: Pouf>(raw_data: &D::RawData) -> Result<Self> {
+        D::from_raw_data::<shims::RootMetadata>(raw_data)?.try_into_metadata::<D>()
     }
 }
 
@@ -1264,6 +1260,13 @@ impl Metadata for TimestampMetadata {
     fn expires(&self) -> &DateTime<Utc> {
         &self.expires
     }
+    fn to_raw_data<D: Pouf>(&self) -> Result<D::RawData> {
+        D::to_raw_data(self)
+    }
+
+    fn from_raw_data<D: Pouf>(raw_data: &D::RawData) -> Result<Self> {
+        D::from_raw_data(raw_data)
+    }
 }
 
 impl Serialize for TimestampMetadata {
@@ -1533,6 +1536,13 @@ impl Metadata for SnapshotMetadata {
 
     fn expires(&self) -> &DateTime<Utc> {
         &self.expires
+    }
+    fn to_raw_data<D: Pouf>(&self) -> Result<D::RawData> {
+        D::to_raw_data(self)
+    }
+
+    fn from_raw_data<D: Pouf>(raw_data: &D::RawData) -> Result<Self> {
+        D::from_raw_data(raw_data)
     }
 }
 
@@ -1967,25 +1977,12 @@ impl Metadata for TargetsMetadata {
     fn expires(&self) -> &DateTime<Utc> {
         &self.expires
     }
-}
-
-impl Serialize for TargetsMetadata {
-    fn serialize<S>(&self, ser: S) -> ::std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        shims::TargetsMetadata::from(self)
-            .map_err(|e| SerializeError::custom(format!("{:?}", e)))?
-            .serialize(ser)
+    fn to_raw_data<D: Pouf>(&self) -> Result<D::RawData> {
+        D::to_raw_data(&shims::TargetsMetadata::from_metadata::<D>(self)?)
     }
-}
 
-impl<'de> Deserialize<'de> for TargetsMetadata {
-    fn deserialize<D: Deserializer<'de>>(de: D) -> ::std::result::Result<Self, D::Error> {
-        let intermediate: shims::TargetsMetadata = Deserialize::deserialize(de)?;
-        intermediate
-            .try_into()
-            .map_err(|e| DeserializeError::custom(format!("{:?}", e)))
+    fn from_raw_data<D: Pouf>(raw_data: &D::RawData) -> Result<Self> {
+        D::from_raw_data::<shims::TargetsMetadata>(raw_data)?.try_into_metadata::<D>()
     }
 }
 
@@ -2141,21 +2138,15 @@ impl Delegations {
     }
 }
 
-impl Serialize for Delegations {
-    fn serialize<S>(&self, ser: S) -> ::std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        shims::Delegations::from(self).serialize(ser)
+impl Delegations {
+    /// Write these delegations out as `D`'s raw data.
+    pub fn to_raw_data<D: Pouf>(&self) -> Result<D::RawData> {
+        D::to_raw_data(&shims::Delegations::from_metadata::<D>(self)?)
     }
-}
 
-impl<'de> Deserialize<'de> for Delegations {
-    fn deserialize<D: Deserializer<'de>>(de: D) -> ::std::result::Result<Self, D::Error> {
-        let intermediate: shims::Delegations = Deserialize::deserialize(de)?;
-        intermediate
-            .try_into()
-            .map_err(|e| DeserializeError::custom(format!("{:?}", e)))
+    /// Read delegations back out of `D`'s raw data.
+    pub fn from_raw_data<D: Pouf>(raw_data: &D::RawData) -> Result<Self> {
+        D::from_raw_data::<shims::Delegations>(raw_data)?.try_into_metadata::<D>()
     }
 }
 
@@ -2612,9 +2603,9 @@ mod test {
             },
         });
 
-        let encoded = serde_json::to_value(&root).unwrap();
+        let encoded = root.to_raw_data::<Pouf1>().unwrap();
         assert_eq!(encoded, jsn);
-        let decoded: RootMetadata = serde_json::from_value(encoded).unwrap();
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&encoded).unwrap();
         assert_eq!(decoded, root);
     }
 
@@ -2661,7 +2652,7 @@ mod test {
             "quux": true,
         });
 
-        let root: RootMetadata = serde_json::from_value(jsn.clone()).unwrap();
+        let root = RootMetadata::from_raw_data::<Pouf1>(&jsn).unwrap();
         assert_eq!(
             root.additional_fields()["custom"],
             json!({"foo": 42, "bar": "baz"})
@@ -2669,8 +2660,13 @@ mod test {
         assert_eq!(root.additional_fields()["quux"], json!(true));
 
         // make sure additional_fields are passed through serialization as well
-        assert_eq!(jsn, serde_json::to_value(&root).unwrap());
+        assert_eq!(jsn, root.to_raw_data::<Pouf1>().unwrap());
     }
+
+    /// The key id `jsn_root_metadata_without_keyid_hash_algos` gives to `ED25519_1_PK8`, which is
+    /// not the one this crate derives from the key material.
+    const LEGACY_ROOT_KEY_ID: &str =
+        "e0294a3f17cc8563c3ed5fceb3bd8d3f6bfeeaca499b5c9572729ae015566554";
 
     fn jsn_root_metadata_without_keyid_hash_algos() -> serde_json::Value {
         json!({
@@ -2733,41 +2729,84 @@ mod test {
     #[test]
     fn de_ser_root_metadata_without_keyid_hash_algorithms() {
         let jsn = jsn_root_metadata_without_keyid_hash_algos();
-        let decoded: RootMetadata = serde_json::from_value(jsn.clone()).unwrap();
-        let encoded = serde_json::to_value(decoded).unwrap();
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&jsn).unwrap();
+        let encoded = decoded.to_raw_data::<Pouf1>().unwrap();
 
         assert_eq!(jsn, encoded);
     }
 
+    /// Key ids are opaque, so a key is named whatever the metadata that carries it calls it, even
+    /// when this crate would have derived a different name from the key material.
     #[test]
-    /// Key ids are opaque, so a key is named whatever the metadata that carries it calls it,
-    /// even when this crate would have derived a different name from the key material. Such a key
-    /// used to be silently discarded.
-    fn de_ser_root_metadata_renamed_key() {
+    fn de_ser_root_metadata_keeps_the_key_ids_the_metadata_assigned() {
         let jsn = jsn_root_metadata_without_keyid_hash_algos();
-        let mut jsn_str = str::from_utf8(&Pouf1::signing_input(&jsn).unwrap())
-            .unwrap()
-            .to_owned();
-        // Replace the key id to something else.
-        jsn_str = jsn_str.replace(
-            "12435b260b6172bd750aeb102f54a347c56b109e0524ab1f144593c07af66356",
-            "00435b260b6172bd750aeb102f54a347c56b109e0524ab1f144593c07af66356",
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&jsn).unwrap();
+
+        assert_eq!(decoded.keys.len(), 4);
+
+        for (key_id, key) in &decoded.keys {
+            assert_eq!(key.key_id(), key_id);
+        }
+
+        let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
+        let key_id = KeyId::from_str(LEGACY_ROOT_KEY_ID).unwrap();
+
+        assert_ne!(root_key.public().key_id(), &key_id);
+        assert_eq!(
+            decoded.keys.get(&key_id).unwrap().as_bytes(),
+            root_key.public().as_bytes()
         );
-        let decoded: RootMetadata = serde_json::from_str(&jsn_str).unwrap();
 
-        assert_eq!(4, decoded.keys.len());
+        // ... and the metadata still round trips.
+        assert_eq!(decoded.to_raw_data::<Pouf1>().unwrap(), jsn);
+    }
 
-        let renamed =
-            KeyId::from_str("00435b260b6172bd750aeb102f54a347c56b109e0524ab1f144593c07af66356")
-                .unwrap();
-        assert_eq!(decoded.keys.get(&renamed).unwrap().key_id(), &renamed);
+    /// A repository is free to carry keys of types this crate does not support, and those keys
+    /// must not stop the rest of the metadata from being read.
+    #[test]
+    fn unknown_key_types_do_not_break_parsing() {
+        let root = json!({
+            "_type": "root",
+            "spec_version": "1.0.0",
+            "version": 1,
+            "expires": "2017-01-01T00:00:00Z",
+            "consistent_snapshot": false,
+            "keys": {
+                "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f": {
+                    "keytype": "ed25519",
+                    "scheme": "ed25519",
+                    "keyval": {
+                        "public": "eb8ac26b5c9ef0279e3be3e82262a93bce16fe58ee422500d38caf461c65a3b6",
+                    },
+                },
+                "0000000000000000000000000000000000000000000000000000000000000000": {
+                    "keytype": "ecdsa-sha2-nistp256",
+                    "scheme": "ecdsa-sha2-nistp256",
+                    "keyval": {
+                        "public": "04cbc5cab2684160323c25cd06c3307178a6b1d1c9b949328453ae473c5ba7527e35b13f298b41633382241f3fd8526c262d43b45adee5c618fa0642c82b8a9803",
+                    },
+                },
+            },
+            "roles": {
+                "root": { "threshold": 1, "keyids": ["061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f"] },
+                "snapshot": { "threshold": 1, "keyids": ["061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f"] },
+                "targets": { "threshold": 1, "keyids": ["061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f"] },
+                "timestamp": { "threshold": 1, "keyids": ["0000000000000000000000000000000000000000000000000000000000000000"] },
+            },
+        });
+
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&root).unwrap();
+        assert_eq!(decoded.keys.len(), 2);
+
+        // ... and it survives a round trip untouched.
+        assert_eq!(decoded.to_raw_data::<Pouf1>().unwrap(), root);
     }
 
     #[test]
     fn sign_and_verify_root_metadata() {
         let jsn = jsn_root_metadata_without_keyid_hash_algos();
         let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
-        let decoded: RootMetadata = serde_json::from_value(jsn).unwrap();
+        let decoded = RootMetadata::from_raw_data::<Pouf1>(&jsn).unwrap();
 
         let signed: SignedMetadata<crate::pouf::pouf1::Pouf1, _> =
             SignedMetadata::new(&decoded, &root_key).unwrap();
@@ -2788,12 +2827,18 @@ mod test {
     fn verify_signed_serialized_root_metadata() {
         let jsn = json!({
             "signatures": [{
-                "keyid": "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f",
+                "keyid": "e0294a3f17cc8563c3ed5fceb3bd8d3f6bfeeaca499b5c9572729ae015566554",
                 "sig": "1f944e022d0b30c5a9ddc9c210026f396e18a17cc9a4ee92c339a8ee63357608dba8121847a825c3a5c84c1081435436bd784c8086c3103cdd1489e79cff2802"
             }],
             "signed": jsn_root_metadata_without_keyid_hash_algos()
         });
-        let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
+        // This metadata was written by an implementation that derived key ids some other way,
+        // so the key has to be named the way the metadata names it.
+        let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8)
+            .unwrap()
+            .public()
+            .clone()
+            .with_key_id(KeyId::from_str(LEGACY_ROOT_KEY_ID).unwrap());
         let decoded: SignedMetadata<crate::pouf::pouf1::Pouf1, RootMetadata> =
             serde_json::from_value(jsn).unwrap();
         let raw_root = decoded.to_raw().unwrap();
@@ -2803,7 +2848,7 @@ mod test {
                 &MetadataPath::root(),
                 &raw_root,
                 MetadataThreshold::ONE,
-                &[root_key.public().clone()]
+                &[root_key]
             ),
             Ok(_)
         );
@@ -2813,16 +2858,22 @@ mod test {
     fn verify_signed_serialized_root_metadata_with_duplicate_sig() {
         let jsn = json!({
             "signatures": [{
-                "keyid": "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f",
+                "keyid": "e0294a3f17cc8563c3ed5fceb3bd8d3f6bfeeaca499b5c9572729ae015566554",
                 "sig": "1f944e022d0b30c5a9ddc9c210026f396e18a17cc9a4ee92c339a8ee63357608dba8121847a825c3a5c84c1081435436bd784c8086c3103cdd1489e79cff2802"
             },
             {
-                "keyid": "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f",
+                "keyid": "e0294a3f17cc8563c3ed5fceb3bd8d3f6bfeeaca499b5c9572729ae015566554",
                 "sig": "1f944e022d0b30c5a9ddc9c210026f396e18a17cc9a4ee92c339a8ee63357608dba8121847a825c3a5c84c1081435436bd784c8086c3103cdd1489e79cff2802"
             }],
             "signed": jsn_root_metadata_without_keyid_hash_algos()
         });
-        let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
+        // This metadata was written by an implementation that derived key ids some other way,
+        // so the key has to be named the way the metadata names it.
+        let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8)
+            .unwrap()
+            .public()
+            .clone()
+            .with_key_id(KeyId::from_str(LEGACY_ROOT_KEY_ID).unwrap());
         let decoded: SignedMetadata<crate::pouf::pouf1::Pouf1, RootMetadata> =
             serde_json::from_value(jsn).unwrap();
         let raw_root = decoded.to_raw().unwrap();
@@ -2831,7 +2882,7 @@ mod test {
                 &MetadataPath::root(),
                 &raw_root,
                 TWO.into(),
-                &[root_key.public().clone()]
+                std::slice::from_ref(&root_key)
             ),
             Err(Error::MetadataMissingSignatures {
                 role,
@@ -2845,7 +2896,7 @@ mod test {
                 &MetadataPath::root(),
                 &raw_root,
                 MetadataThreshold::ONE,
-                &[root_key.public().clone()]
+                &[root_key]
             ),
             Ok(_)
         );
@@ -3295,9 +3346,9 @@ mod test {
                 },
             });
 
-            let encoded = serde_json::to_value(&targets).unwrap();
+            let encoded = targets.to_raw_data::<Pouf1>().unwrap();
             assert_eq!(encoded, jsn);
-            let decoded: TargetsMetadata = serde_json::from_value(encoded).unwrap();
+            let decoded = TargetsMetadata::from_raw_data::<Pouf1>(&encoded).unwrap();
             assert_eq!(decoded, targets);
         })
     }
@@ -3351,7 +3402,7 @@ mod test {
             "quux": true,
         });
 
-        let targets: TargetsMetadata = serde_json::from_value(jsn.clone()).unwrap();
+        let targets = TargetsMetadata::from_raw_data::<Pouf1>(&jsn).unwrap();
         assert_eq!(
             targets.additional_fields()["custom"],
             json!({"foo": 42, "bar": "baz"})
@@ -3359,7 +3410,7 @@ mod test {
         assert_eq!(targets.additional_fields()["quux"], json!(true));
 
         // make sure additional_fields are passed through serialization as well
-        assert_eq!(jsn, serde_json::to_value(&targets).unwrap());
+        assert_eq!(jsn, targets.to_raw_data::<Pouf1>().unwrap());
     }
 
     #[test]
@@ -3415,9 +3466,9 @@ mod test {
             }
         });
 
-        let encoded = serde_json::to_value(&targets).unwrap();
+        let encoded = targets.to_raw_data::<Pouf1>().unwrap();
         assert_eq!(encoded, jsn);
-        let decoded: TargetsMetadata = serde_json::from_value(encoded).unwrap();
+        let decoded = TargetsMetadata::from_raw_data::<Pouf1>(&encoded).unwrap();
         assert_eq!(decoded, targets);
     }
 
@@ -3512,7 +3563,7 @@ mod test {
             .build()
             .unwrap();
 
-        serde_json::to_value(&root).unwrap()
+        root.to_raw_data::<Pouf1>().unwrap()
     }
 
     fn make_snapshot() -> serde_json::Value {
@@ -3552,7 +3603,7 @@ mod test {
         )
         .unwrap();
 
-        serde_json::to_value(&targets).unwrap()
+        targets.to_raw_data::<Pouf1>().unwrap()
     }
 
     fn make_delegations() -> serde_json::Value {
@@ -3575,7 +3626,7 @@ mod test {
         )
         .unwrap();
 
-        serde_json::to_value(&delegations).unwrap()
+        delegations.to_raw_data::<Pouf1>().unwrap()
     }
 
     fn make_delegation() -> serde_json::Value {
@@ -3609,11 +3660,11 @@ mod test {
     fn deserialize_json_root_illegal_version() {
         let mut root_json = make_root();
         set_version(&mut root_json, 0);
-        assert!(serde_json::from_value::<RootMetadata>(root_json.clone()).is_err());
+        assert!(RootMetadata::from_raw_data::<Pouf1>(&root_json).is_err());
 
         let mut root_json = make_root();
         set_version(&mut root_json, -1);
-        assert!(serde_json::from_value::<RootMetadata>(root_json).is_err());
+        assert!(RootMetadata::from_raw_data::<Pouf1>(&root_json).is_err());
     }
 
     // Refuse to deserialize root metadata if it contains duplicate keys
@@ -3660,16 +3711,12 @@ mod test {
                 }
             }
         }"#;
-        match serde_json::from_str::<RootMetadata>(root_json) {
-            Err(ref err) if err.is_data() => {
-                assert!(
-                    err.to_string().starts_with("Cannot have duplicate keys"),
-                    "unexpected err: {:?}",
-                    err
-                );
-            }
-            result => panic!("unexpected result: {:?}", result),
-        }
+        // Duplicate rejection lives in the shims, which is the layer that sees the document as
+        // it was written rather than as `serde_json::Value` collapsed it.
+        assert_matches!(
+            serde_json::from_str::<shims::RootMetadata>(root_json),
+            Err(err) if err.to_string().starts_with("Cannot have duplicate keys")
+        );
     }
 
     fn set_threshold(value: &mut serde_json::Value, threshold: i32) {
@@ -3734,7 +3781,7 @@ mod test {
             .as_object_mut()
             .unwrap()
             .insert("_type".into(), json!("snapshot"));
-        assert!(serde_json::from_value::<RootMetadata>(root).is_err());
+        assert!(RootMetadata::from_raw_data::<Pouf1>(&root).is_err());
     }
 
     // Refuse to deserialize root metadata with unknown spec version
@@ -3745,7 +3792,7 @@ mod test {
             .as_object_mut()
             .unwrap()
             .insert("spec_version".into(), json!("0"));
-        assert!(serde_json::from_value::<RootMetadata>(root).is_err());
+        assert!(RootMetadata::from_raw_data::<Pouf1>(&root).is_err());
     }
 
     // Refuse to deserialize role definitions with duplicated key ids
@@ -3907,11 +3954,11 @@ mod test {
     fn deserialize_json_targets_illegal_version() {
         let mut targets = make_targets();
         set_version(&mut targets, 0);
-        assert!(serde_json::from_value::<TargetsMetadata>(targets).is_err());
+        assert!(TargetsMetadata::from_raw_data::<Pouf1>(&targets).is_err());
 
         let mut targets = make_targets();
         set_version(&mut targets, -1);
-        assert!(serde_json::from_value::<TargetsMetadata>(targets).is_err());
+        assert!(TargetsMetadata::from_raw_data::<Pouf1>(&targets).is_err());
     }
 
     // Refuse to deserialize targets metadata with wrong type field
@@ -3922,7 +3969,7 @@ mod test {
             .as_object_mut()
             .unwrap()
             .insert("_type".into(), json!("root"));
-        assert!(serde_json::from_value::<TargetsMetadata>(targets).is_err());
+        assert!(TargetsMetadata::from_raw_data::<Pouf1>(&targets).is_err());
     }
 
     // Refuse to deserialize targets metadata with unknown spec version
@@ -3933,7 +3980,7 @@ mod test {
             .as_object_mut()
             .unwrap()
             .insert("spec_version".into(), json!("0"));
-        assert!(serde_json::from_value::<TargetsMetadata>(targets).is_err());
+        assert!(TargetsMetadata::from_raw_data::<Pouf1>(&targets).is_err());
     }
 
     #[test]
@@ -3943,7 +3990,7 @@ mod test {
             .as_object_mut()
             .unwrap()
             .insert("spec_version".into(), json!("1.0.31"));
-        assert!(serde_json::from_value::<RootMetadata>(root).is_ok());
+        assert!(RootMetadata::from_raw_data::<Pouf1>(&root).is_ok());
     }
 
     #[test]
@@ -3953,7 +4000,7 @@ mod test {
             .as_object_mut()
             .unwrap()
             .insert("spec_version".into(), json!("1.0"));
-        assert!(serde_json::from_value::<RootMetadata>(root).is_ok());
+        assert!(RootMetadata::from_raw_data::<Pouf1>(&root).is_ok());
     }
 
     // Refuse to deserialize delegations with duplicated roles
@@ -3976,7 +4023,7 @@ mod test {
             .as_array_mut()
             .unwrap()
             .push(dupe);
-        assert!(serde_json::from_value::<Delegations>(delegations).is_err());
+        assert!(Delegations::from_raw_data::<Pouf1>(&delegations).is_err());
     }
 
     // Refuse to deserialize a delegation with insufficient threshold
@@ -4042,34 +4089,38 @@ mod test {
     fn deserialize_json_delegations_duplicate_keys() {
         let delegations_json = r#"{
             "keys": {
-                "qfrfBrkB4lBBSDEBlZgaTGS_SrE6UfmON9kP4i3dJFY=": {
-                    "public_key": "MCwwBwYDK2VwBQADIQDrisJrXJ7wJ5474-giYqk7zhb-WO5CJQDTjK9GHGWjtg==",
+                "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f": {
+                    "keytype": "ed25519",
                     "scheme": "ed25519",
-                    "type": "ed25519"
+                    "keyval": {
+                        "public": "eb8ac26b5c9ef0279e3be3e82262a93bce16fe58ee422500d38caf461c65a3b6"
+                    }
                 },
-                "qfrfBrkB4lBBSDEBlZgaTGS_SrE6UfmON9kP4i3dJFY=": {
-                    "public_key": "MCwwBwYDK2VwBQADIQDrisJrXJ7wJ5474-giYqk7zhb-WO5CJQDTjK9GHGWjtg==",
+                "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f": {
+                    "keytype": "ed25519",
                     "scheme": "ed25519",
-                    "type": "ed25519"
+                    "keyval": {
+                        "public": "eb8ac26b5c9ef0279e3be3e82262a93bce16fe58ee422500d38caf461c65a3b6"
+                    }
                 }
             },
             "roles": [
             {
                 "keyids": [
-                    "qfrfBrkB4lBBSDEBlZgaTGS_SrE6UfmON9kP4i3dJFY="
+                    "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f"
                 ],
                 "paths": [
                     "bar"
                 ],
-                "role": "foo",
+                "name": "foo",
                 "terminating": false,
                 "threshold": 1
             }
             ]
         }"#;
-        match serde_json::from_str::<Delegations>(delegations_json) {
-            Err(ref err) if err.is_data() => {}
-            result => panic!("unexpected result: {:?}", result),
-        }
+        assert_matches!(
+            serde_json::from_str::<shims::Delegations>(delegations_json),
+            Err(err) if err.to_string().starts_with("Cannot have duplicate keys")
+        );
     }
 }

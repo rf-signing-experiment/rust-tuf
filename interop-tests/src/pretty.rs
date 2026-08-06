@@ -3,7 +3,7 @@ use {
     serde::ser::Serialize,
     tuf::{
         Result,
-        crypto::Signature,
+        crypto::{KeyType, PublicKey, Signature, SignatureScheme},
         pouf::{Pouf, Pouf1, SignedDocument},
     },
 };
@@ -139,5 +139,17 @@ impl Pouf for JsonPretty {
 
     fn deserialize_signed(slice: &[u8]) -> Result<(Vec<Signature>, Self::RawData)> {
         Pouf1::deserialize_signed(slice)
+    }
+
+    fn encode_public_key(public_key: &PublicKey) -> Result<String> {
+        Pouf1::encode_public_key(public_key)
+    }
+
+    fn decode_public_key(
+        key_type: KeyType,
+        scheme: SignatureScheme,
+        public: &str,
+    ) -> Result<PublicKey> {
+        Pouf1::decode_public_key(key_type, scheme, public)
     }
 }

@@ -1,13 +1,14 @@
 //! Structures and functions to aid in various TUF data pouf formats.
 
 pub(crate) mod pouf1;
+pub(crate) mod shims;
 pub use pouf1::Pouf1;
 
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
 use crate::Result;
-use crate::crypto::Signature;
+use crate::crypto::{KeyType, PublicKey, Signature, SignatureScheme};
 
 /// The `{"signatures": ..., "signed": ...}` document that the JSON poufs write.
 #[derive(serde::Serialize)]
@@ -62,6 +63,19 @@ pub trait Pouf: Sized + Sync {
     fn from_raw_data<T>(raw_data: &Self::RawData) -> Result<T>
     where
         T: DeserializeOwned;
+
+    /// Encode a public key as a string.
+    fn encode_public_key(public_key: &PublicKey) -> Result<String>;
+
+    /// Read back a public key this pouf wrote.
+    ///
+    /// `public` is the value [`encode_public_key`](Pouf::encode_public_key) produced, and
+    /// `key_type` and `scheme` are the ones the metadata listed alongside it.
+    fn decode_public_key(
+        key_type: KeyType,
+        scheme: SignatureScheme,
+        public: &str,
+    ) -> Result<PublicKey>;
 
     /// Write signed metadata out in the pouf's wire format.
     ///
