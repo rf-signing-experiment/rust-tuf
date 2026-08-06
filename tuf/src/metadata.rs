@@ -2566,7 +2566,6 @@ mod test {
                 "601203edea364287aa3975600d8119c9a69547327c796d9294eb8864a8a6051a": {
                     "keytype": "ed25519",
                     "scheme": "ed25519",
-                    "keyid_hash_algorithms": ["sha256", "sha512"],
                     "keyval": {
                         "public": "1410ae3053aa70bbfa98428a879d64d3002a3578f7dfaaeb1cb0764e860f7e0b",
                     },
@@ -2574,7 +2573,6 @@ mod test {
                 "d207aed8ba8477d25e44b4ca70499f34c816e927a20db10d190940735f541490": {
                     "keytype": "ed25519",
                     "scheme": "ed25519",
-                    "keyid_hash_algorithms": ["sha256", "sha512"],
                     "keyval": {
                         "public": "166376c90a7f717d027056272f361c252fb050bed1a067ff2089a0302fbab73d",
                     },
@@ -2582,7 +2580,6 @@ mod test {
                 "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f": {
                     "keytype": "ed25519",
                     "scheme": "ed25519",
-                    "keyid_hash_algorithms": ["sha256", "sha512"],
                     "keyval": {
                         "public": "eb8ac26b5c9ef0279e3be3e82262a93bce16fe58ee422500d38caf461c65a3b6",
                     },
@@ -2590,7 +2587,6 @@ mod test {
                 "9657767384c8b192422d757b64187d6188ff93dd78cbe6141c3b7ddae5adac06": {
                     "keytype": "ed25519",
                     "scheme": "ed25519",
-                    "keyid_hash_algorithms": ["sha256", "sha512"],
                     "keyval": {
                         "public": "68d9ecb387371005a8eb8e60105305c34356a8fcd859d7fef3cc228bf2b2b3b2",
                     },
@@ -2634,7 +2630,6 @@ mod test {
                 "601203edea364287aa3975600d8119c9a69547327c796d9294eb8864a8a6051a": {
                     "keytype": "ed25519",
                     "scheme": "ed25519",
-                    "keyid_hash_algorithms": ["sha256", "sha512"],
                     "keyval": {
                         "public": "1410ae3053aa70bbfa98428a879d64d3002a3578f7dfaaeb1cb0764e860f7e0b",
                     },
@@ -3402,7 +3397,6 @@ mod test {
                     "061627f2f863b7d4437ba1abe099d9732b19b961e8d7550f799ac77c1c0c589f": {
                         "keytype": "ed25519",
                         "scheme": "ed25519",
-                        "keyid_hash_algorithms": ["sha256", "sha512"],
                         "keyval": {
                             "public": "eb8ac26b5c9ef0279e3be3e82262a93bce16fe58\
                                 ee422500d38caf461c65a3b6",
