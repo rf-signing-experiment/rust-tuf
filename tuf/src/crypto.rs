@@ -13,6 +13,11 @@ use {
         Deserialize, Deserializer, Serialize, Serializer, de::Error as DeserializeError,
         ser::Error as SerializeError,
     },
+    spki::{
+        AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicKeyInfoOwned,
+        SubjectPublicKeyInfoRef,
+        der::{Decode as _, Encode as _, asn1::BitString},
+    },
     std::{
         cmp::Ordering,
         collections::HashMap,
@@ -20,7 +25,6 @@ use {
         hash,
         str::FromStr,
     },
-    untrusted::Input,
 };
 
 use crate::error::{Error, Result};
@@ -29,10 +33,8 @@ use crate::pouf::pouf1::shims;
 
 const HASH_ALG_PREFS: &[HashAlgorithm] = &[HashAlgorithm::Sha512, HashAlgorithm::Sha256];
 
-/// 1.3.101.112 curveEd25519(EdDSA 25519 signature algorithm)
-const ED25519_SPKI_HEADER: &[u8] = &[
-    0x30, 0x2c, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x05, 0x00, 0x03, 0x21, 0x00,
-];
+/// `id-Ed25519` as defined in [RFC 8410](https://datatracker.ietf.org/doc/html/rfc8410).
+const ED25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
 
 /// The length of an ed25519 private key in bytes
 const ED25519_PRIVATE_KEY_LENGTH: usize = 32;
@@ -567,30 +569,14 @@ impl PublicKey {
         scheme: SignatureScheme,
         keyid_hash_algorithms: Option<Vec<String>>,
     ) -> Result<Self> {
-        fn der_error(s: &str) -> Error {
-            Error::Encoding(s.into())
-        }
-
-        let (typ, expected_header) = match scheme {
-            SignatureScheme::Ed25519 => (KeyType::Ed25519, ED25519_SPKI_HEADER),
+        let typ = match scheme {
+            SignatureScheme::Ed25519 => KeyType::Ed25519,
             SignatureScheme::Unknown(s) => {
                 return Err(Error::UnknownSignatureScheme(s));
             }
         };
 
-        let input = Input::from(der_bytes);
-        let value = input.read_all(der_error("DER: unexpected trailing input"), |input| {
-            let actual_header = input
-                .read_bytes(expected_header.len())
-                .map_err(|_: untrusted::EndOfInput| der_error("DER: Invalid SPKI header"))?;
-            if actual_header.as_slice_less_safe() != expected_header {
-                return Err(Error::Encoding("DER: Unsupported SPKI header value".into()));
-            }
-            let value = input
-                .read_bytes(ED25519_PUBLIC_KEY_LENGTH)
-                .map_err(|_: untrusted::EndOfInput| der_error("DER: Invalid SPKI value"))?;
-            Ok(value.as_slice_less_safe().to_vec())
-        })?;
+        let value = read_spki(der_bytes, &typ)?;
 
         Self::new(typ, scheme, keyid_hash_algorithms, value)
     }
@@ -868,18 +854,62 @@ impl Display for HashValue {
 }
 
 fn write_spki(public: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
-    let header = match key_type {
-        KeyType::Ed25519 => ED25519_SPKI_HEADER,
-        KeyType::Unknown(s) => {
-            return Err(Error::UnknownKeyType(s.to_owned()));
-        }
+    let oid = key_oid(key_type)?;
+
+    let spki = SubjectPublicKeyInfoOwned {
+        // RFC 8410 §3: for the id-Ed25519 algorithm the parameters must be absent. Earlier
+        // versions of this crate wrote an explicit NULL, which `read_spki` still accepts.
+        algorithm: AlgorithmIdentifierOwned {
+            oid,
+            parameters: None,
+        },
+        subject_public_key: BitString::new(0, public).map_err(spki_error)?,
     };
 
-    let mut output = Vec::with_capacity(header.len() + public.len());
-    output.extend_from_slice(header);
-    output.extend_from_slice(public);
+    spki.to_der().map_err(spki_error)
+}
 
-    Ok(output)
+/// Read a key's raw bytes out of `SubjectPublicKeyInfo` DER bytes.
+fn read_spki(der_bytes: &[u8], key_type: &KeyType) -> Result<Vec<u8>> {
+    let oid = key_oid(key_type)?;
+    let spki = SubjectPublicKeyInfoRef::from_der(der_bytes).map_err(spki_error)?;
+
+    if spki.algorithm.oid != oid {
+        return Err(Error::Encoding(format!(
+            "SPKI: expected a {} key ({}), found {}",
+            key_type, oid, spki.algorithm.oid,
+        )));
+    }
+
+    // The algorithm's parameters are not checked, so that a key written by an earlier version of
+    // this crate, which spelled them as an explicit NULL, is still read.
+
+    let public = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| Error::Encoding("SPKI: public key is not a whole number of bytes".into()))?;
+
+    if key_type == &KeyType::Ed25519 && public.len() != ED25519_PUBLIC_KEY_LENGTH {
+        return Err(Error::Encoding(format!(
+            "SPKI: ed25519 public keys must be {} bytes long, got {}",
+            ED25519_PUBLIC_KEY_LENGTH,
+            public.len(),
+        )));
+    }
+
+    Ok(public.to_vec())
+}
+
+/// The algorithm identifier this key type is written with inside a `SubjectPublicKeyInfo`.
+fn key_oid(key_type: &KeyType) -> Result<ObjectIdentifier> {
+    match key_type {
+        KeyType::Ed25519 => Ok(ED25519_OID),
+        KeyType::Unknown(s) => Err(Error::UnknownKeyType(s.to_owned())),
+    }
+}
+
+fn spki_error(err: impl Display) -> Error {
+    Error::Encoding(format!("SPKI: {}", err))
 }
 
 #[cfg(test)]
