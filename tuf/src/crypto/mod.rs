@@ -388,6 +388,22 @@ fn calculate_key_id(algorithm: KeyAlgorithm, public_key: &[u8]) -> Result<KeyId>
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyId(String);
 
+impl KeyId {
+    /// Return the key ID as a `&str`.
+    ///
+    /// A key id is written into metadata verbatim and compared verbatim, so callers need to
+    /// reach the string itself and not only a formatted copy of it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for KeyId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl FromStr for KeyId {
     type Err = Error;
 
@@ -758,6 +774,18 @@ impl PublicKey {
 
     /// Use this key to verify a message with a signature.
     pub fn verify(&self, role: &MetadataPath, msg: &[u8], sig: &Signature) -> Result<()> {
+        self.verify_bytes(msg, &sig.value.0).map_err(|err| match err {
+            // The caller knows which role this was, and the error should say so.
+            Error::SignatureVerificationFailed => Error::BadSignature(role.clone()),
+            other => other,
+        })
+    }
+
+    /// Use this key to verify a detached signature over `msg`.
+    ///
+    /// [`verify`](Self::verify) is the same check for a signature that came out of
+    /// metadata, where there is a role to name in the error.
+    pub fn verify_bytes(&self, msg: &[u8], sig: &[u8]) -> Result<()> {
         // A key that was never understood cannot check anything, whatever it claims to be.
         let PublicKeyValue::Known {
             algorithm,
@@ -780,8 +808,8 @@ impl PublicKey {
         };
 
         ring::signature::UnparsedPublicKey::new(verification, bytes)
-            .verify(msg, &sig.value.0)
-            .map_err(|_| Error::BadSignature(role.clone()))
+            .verify(msg, sig)
+            .map_err(|_| Error::SignatureVerificationFailed)
     }
 }
 

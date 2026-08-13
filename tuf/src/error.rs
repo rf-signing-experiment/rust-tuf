@@ -21,6 +21,13 @@ pub enum Error {
     #[error("metadata {0} has a bad signature")]
     BadSignature(MetadataPath),
 
+    /// A signature did not verify against the key it was checked with.
+    ///
+    /// [`BadSignature`](Self::BadSignature) is the same failure for a signature that came
+    /// out of metadata, where there is a role to name.
+    #[error("signature does not verify")]
+    SignatureVerificationFailed,
+
     /// There was a problem encoding or decoding.
     #[error("encoding: {0}")]
     Encoding(String),
