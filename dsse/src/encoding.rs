@@ -125,8 +125,9 @@ base64_newtype!(
 /// A hint identifying which key produced a [signature](crate::DsseSignature).
 ///
 /// DSSE does not assign any meaning to the contents of a key id, so this is an
-/// opaque string that serializes as-is.
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// opaque string that serializes as-is. It is nonetheless ordered, so that a
+/// producer can sort an envelope's signatures and get the same bytes every time.
+#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct KeyId(String);
 
