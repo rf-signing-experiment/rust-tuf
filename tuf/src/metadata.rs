@@ -1028,6 +1028,11 @@ impl MetadataPath {
         }
     }
 
+    /// Return the path as a `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Split `MetadataPath` into components that can be joined to create URL paths, Unix paths, or
     /// Windows paths.
     ///
