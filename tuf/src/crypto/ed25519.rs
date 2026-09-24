@@ -1,16 +1,23 @@
 //! Ed25519 keys, as defined in [RFC 8032](https://datatracker.ietf.org/doc/html/rfc8032).
 
 use {
-    ring::{
-        rand::SystemRandom,
-        signature::{ED25519, Ed25519KeyPair, KeyPair, VerificationAlgorithm},
+    ed25519_dalek::{
+        SigningKey, VerifyingKey,
+        pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
     },
-    spki::ObjectIdentifier,
+    signature::{Signer as _, Verifier as _},
+    spki::{
+        ObjectIdentifier,
+        der::{
+            Decode as _, Encode as _, Reader as _, SliceReader, Tag, TagNumber, Tagged as _,
+            asn1::AnyRef,
+        },
+    },
 };
 
 use super::{
     AlgorithmParameters, AlgorithmSpec, KeyType, PrivateKey, PublicKey, Signature, SignatureScheme,
-    SignatureValue,
+    SignatureValue, VerificationAlgorithm,
 };
 use crate::error::{Error, Result};
 
@@ -37,11 +44,18 @@ pub(super) static SPEC: AlgorithmSpec = AlgorithmSpec {
 };
 
 /// Ed25519 keys sign under one scheme, the one they are named for.
-fn verification(scheme: &SignatureScheme) -> Option<&'static dyn VerificationAlgorithm> {
+fn verification(scheme: &SignatureScheme) -> Option<VerificationAlgorithm> {
     match *scheme {
-        SignatureScheme::Ed25519 => Some(&ED25519),
+        SignatureScheme::Ed25519 => Some(verify),
         _ => None,
     }
+}
+
+fn verify(public: &[u8], msg: &[u8], sig: &[u8]) -> signature::Result<()> {
+    let public = VerifyingKey::try_from(public)?;
+    let sig = ed25519_dalek::Signature::from_slice(sig)?;
+
+    public.verify(msg, &sig)
 }
 
 /// An ed25519 public key is the raw 32 byte key, with nothing wrapped around it.
@@ -66,15 +80,20 @@ impl PublicKey {
 
 /// A structure containing information about an Ed25519 private key.
 pub struct Ed25519PrivateKey {
-    private: Ed25519KeyPair,
+    private: SigningKey,
     public: PublicKey,
 }
 
 impl Ed25519PrivateKey {
     /// Generate Ed25519 key bytes in pkcs8 format.
     pub fn pkcs8() -> Result<Vec<u8>> {
-        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-            .map(|bytes| bytes.as_ref().to_vec())
+        let mut seed = [0; ED25519_PRIVATE_KEY_LENGTH];
+        getrandom::fill(&mut seed)
+            .map_err(|_| Error::Opaque("Failed to generate Ed25519 key".into()))?;
+
+        SigningKey::from_bytes(&seed)
+            .to_pkcs8_der()
+            .map(|doc| doc.as_bytes().to_vec())
             .map_err(|_| Error::Opaque("Failed to generate Ed25519 key".into()))
     }
 
@@ -87,38 +106,85 @@ impl Ed25519PrivateKey {
             ));
         }
 
-        let private_key_bytes = &key[..ED25519_PRIVATE_KEY_LENGTH];
-        let public_key_bytes = &key[ED25519_PUBLIC_KEY_LENGTH..];
-
-        let private = Ed25519KeyPair::from_seed_and_public_key(private_key_bytes, public_key_bytes)
+        // `from_keypair_bytes` checks that the public half matches the seed.
+        let private = SigningKey::from_keypair_bytes(key.try_into().unwrap())
             .map_err(|err| Error::Encoding(err.to_string()))?;
         Self::from_keypair(private)
     }
 
     /// Read a private key from PKCS#8v2 DER bytes.
+    ///
+    /// Documents written by earlier versions of this crate, which spell the public key the way
+    /// ring does, are read too.
     pub fn from_pkcs8(der_key: &[u8]) -> Result<Self> {
-        Self::from_keypair(
-            Ed25519KeyPair::from_pkcs8(der_key)
-                .map_err(|_| Error::Encoding("Could not parse key as PKCS#8v2".into()))?,
-        )
+        let parse = |der: &[u8]| SigningKey::from_pkcs8_der(der).ok();
+
+        let private = parse(der_key)
+            .or_else(|| parse(&from_ring_pkcs8(der_key)?))
+            .ok_or_else(|| Error::Encoding("Could not parse key as PKCS#8v2".into()))?;
+
+        Self::from_keypair(private)
     }
 
-    fn from_keypair(private: Ed25519KeyPair) -> Result<Self> {
+    fn from_keypair(private: SigningKey) -> Result<Self> {
         let public = PublicKey::new(
             KeyType::Ed25519,
             SignatureScheme::Ed25519,
-            private.public_key().as_ref().to_vec(),
+            private.verifying_key().to_bytes().to_vec(),
         )?;
 
         Ok(Ed25519PrivateKey { private, public })
     }
 }
 
+/// Rewrite a PKCS#8v2 document written by ring into the form RFC 5958 defines.
+///
+/// RFC 5958 §2 has the public key as `[1] IMPLICIT BIT STRING`, but ring, which earlier versions
+/// of this crate generated keys with, writes it as a constructed `[1]` wrapping a `BIT STRING`.
+/// Returns `None` if `der_key` has no public key spelled that way.
+fn from_ring_pkcs8(der_key: &[u8]) -> Option<Vec<u8>> {
+    let public_key_tag = TagNumber(1);
+
+    let document = AnyRef::from_der(der_key).ok()?;
+    if document.tag() != Tag::Sequence {
+        return None;
+    }
+
+    let mut reader = SliceReader::new(document.value()).ok()?;
+    let mut fields = Vec::new();
+    let mut rewritten = false;
+
+    while !reader.is_finished() {
+        let field = AnyRef::decode(&mut reader).ok()?;
+
+        if field.tag() == public_key_tag.context_specific(true) {
+            let bit_string = AnyRef::from_der(field.value()).ok()?;
+            if bit_string.tag() != Tag::BitString {
+                return None;
+            }
+
+            AnyRef::new(public_key_tag.context_specific(false), bit_string.value())
+                .ok()?
+                .encode_to_vec(&mut fields)
+                .ok()?;
+            rewritten = true;
+        } else {
+            field.encode_to_vec(&mut fields).ok()?;
+        }
+    }
+
+    if !rewritten {
+        return None;
+    }
+
+    AnyRef::new(Tag::Sequence, &fields).ok()?.to_der().ok()
+}
+
 impl PrivateKey for Ed25519PrivateKey {
     fn sign(&self, msg: &[u8]) -> Result<Signature> {
         debug_assert!(self.public.scheme == SignatureScheme::Ed25519);
 
-        let value = SignatureValue(self.private.sign(msg).as_ref().into());
+        let value = SignatureValue(self.private.sign(msg).to_vec());
         Ok(Signature {
             key_id: self.public.key_id().clone(),
             value,
@@ -146,7 +212,10 @@ mod test {
     use super::test_data as ed25519;
     use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
-    use ring::signature::KeyPair as _;
+
+    /// The signature over `b"test"` made by `ed25519::PK8_1`, as produced by an independent
+    /// ed25519 implementation. Ed25519 signatures are deterministic, so ours must match exactly.
+    const PK8_1_TEST_SIGNATURE: &str = "fe4d13b2a73c033a1de7f5107b205fc7ba0e1566cb95b92349cae6aa4538956013bfe0f7bf977cb072bb65e8782b5f33a0573fe78816299a017ca5ba559e390c";
 
     #[test]
     fn parse_public_ed25519_spki() {
@@ -207,10 +276,12 @@ mod test {
         let role = MetadataPath::root();
         assert_matches!(pub_key.verify(&role, msg, &sig), Ok(()));
 
-        // Make sure we match what ring expects.
-        let ring_key = ring::signature::Ed25519KeyPair::from_pkcs8(ed25519::PK8_1).unwrap();
-        assert_eq!(key.public().as_bytes(), ring_key.public_key().as_ref());
-        assert_eq!(sig.value().as_bytes(), ring_key.sign(msg).as_ref());
+        // Make sure we match what other implementations produce.
+        assert_eq!(key.public().as_bytes(), ed25519::PUBLIC_KEY);
+        assert_eq!(
+            HEXLOWER.encode(sig.value().as_bytes()),
+            PK8_1_TEST_SIGNATURE
+        );
 
         // Make sure verification fails with the wrong key.
         let bad_pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2)
@@ -236,10 +307,12 @@ mod test {
         let sig = key.sign(msg).unwrap();
         assert_matches!(pub_key.verify(&role, msg, &sig), Ok(()));
 
-        // Make sure we match what ring expects.
-        let ring_key = ring::signature::Ed25519KeyPair::from_pkcs8(ed25519::PK8_1).unwrap();
-        assert_eq!(key.public().as_bytes(), ring_key.public_key().as_ref());
-        assert_eq!(sig.value().as_bytes(), ring_key.sign(msg).as_ref());
+        // Make sure we match what other implementations produce.
+        assert_eq!(key.public().as_bytes(), ed25519::PUBLIC_KEY);
+        assert_eq!(
+            HEXLOWER.encode(sig.value().as_bytes()),
+            PK8_1_TEST_SIGNATURE
+        );
 
         // Make sure verification fails with the wrong key.
         let bad_pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2)
@@ -252,6 +325,24 @@ mod test {
             Err(Error::BadSignature(r))
             if r == role
         );
+    }
+
+    /// Keys generated by earlier versions of this crate spell the PKCS#8v2 public key the way ring
+    /// does, and must still be read.
+    #[test]
+    fn ed25519_reads_pkcs8_written_by_ring() {
+        use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
+
+        assert!(SigningKey::from_pkcs8_der(ed25519::PK8_1).is_err());
+
+        let rewritten = super::from_ring_pkcs8(ed25519::PK8_1).unwrap();
+        assert!(SigningKey::from_pkcs8_der(&rewritten).is_ok());
+
+        let key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_1).unwrap();
+        assert_eq!(key.public().as_bytes(), ed25519::PUBLIC_KEY);
+
+        // A document already in the RFC 5958 form has nothing to rewrite.
+        assert_eq!(super::from_ring_pkcs8(&rewritten), None);
     }
 
     #[test]
