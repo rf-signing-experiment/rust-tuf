@@ -990,12 +990,8 @@ where
         }
 
         for delegation in targets.delegations().roles() {
-            if !delegation.paths().iter().any(|p| target.is_child(p)) {
-                if delegation.terminating() {
-                    return (true, Err(Error::TargetNotFound(target.clone())));
-                } else {
-                    continue;
-                }
+            if !delegation.paths().iter().any(|p| target == p || target.is_child(p)) {
+                continue;
             }
 
             let role_meta = match snapshot.meta().get(delegation.name()) {
@@ -1104,11 +1100,11 @@ where
                         ));
                     let (term, res) = f.await;
 
-                    if term && res.is_err() {
-                        return (true, res);
+                    // Stop at the first delegation that finds the target, or that ends the search
+                    // because it's terminating.
+                    if term || res.is_ok() {
+                        return (term, res);
                     }
-
-                    // TODO end recursion early
                 }
                 Err(_) if !delegation.terminating() => continue,
                 Err(e) => return (true, Err(e)),
@@ -1297,7 +1293,7 @@ mod test {
     use super::*;
     use crate::crypto::{Ed25519PrivateKey, HashAlgorithm, PrivateKey};
     use crate::metadata::{
-        MetadataDescription, MetadataPath, MetadataVersion, RootMetadataBuilder,
+        Delegation, MetadataDescription, MetadataPath, MetadataVersion, RootMetadataBuilder,
         SnapshotMetadataBuilder, TargetsMetadataBuilder, TimestampMetadataBuilder,
     };
     use crate::pouf::Pouf1;
@@ -1311,7 +1307,7 @@ mod test {
     use maplit::hashmap;
     use pretty_assertions::assert_eq;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::iter::once;
     use std::sync::LazyLock;
 
@@ -2123,6 +2119,133 @@ mod test {
             .unwrap();
 
         assert_eq!(description, expected_description);
+    }
+
+    #[test]
+    fn test_fetch_target_description_delegated() {
+        block_on(async {
+            for path in ["a/foo", "b/foo"] {
+                let expected =
+                    TargetDescription::from_slice(path.as_bytes(), &[HashAlgorithm::Sha256])
+                        .unwrap();
+                assert_eq!(
+                    fetch_delegated_target_description(path).await.unwrap(),
+                    expected
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn test_fetch_target_description_stops_at_terminating_delegation() {
+        block_on(async {
+            assert_matches!(
+                fetch_delegated_target_description("c/foo").await,
+                Err(Error::TargetNotFound(_))
+            );
+        })
+    }
+
+    /// Look up `path` in a repository whose top-level targets lists nothing itself, and instead
+    /// delegates to these terminating roles in order:
+    ///
+    /// * `a`, trusted for `a/`, which lists `a/foo`.
+    /// * `b`, trusted for `b/`, which lists `b/foo`.
+    /// * `c`, trusted for `c/`, which lists nothing.
+    /// * `d`, trusted for `c/`, which lists `c/foo`.
+    ///
+    /// Each target's contents are its own path.
+    async fn fetch_delegated_target_description(path: &str) -> Result<TargetDescription> {
+        let delegation_key = &KEYS[1];
+        let roles = [
+            ("a", "a/", Some("a/foo")),
+            ("b", "b/", Some("b/foo")),
+            ("c", "c/", None),
+            ("d", "c/", Some("c/foo")),
+        ];
+
+        let mut delegations = Vec::new();
+        let mut delegated_targets = Vec::new();
+        for (name, prefix, target) in roles {
+            let name = MetadataPath::new(name).unwrap();
+            delegations.push(
+                Delegation::new(
+                    name.clone(),
+                    true,
+                    1,
+                    HashSet::from([delegation_key.public().key_id().clone()]),
+                    HashSet::from([TargetPath::new(prefix).unwrap()]),
+                )
+                .unwrap(),
+            );
+
+            let mut builder = TargetsMetadataBuilder::new();
+            if let Some(target) = target {
+                builder = builder
+                    .insert_target_from_slice(
+                        TargetPath::new(target).unwrap(),
+                        target.as_bytes(),
+                        &[HashAlgorithm::Sha256],
+                    )
+                    .unwrap();
+            }
+            delegated_targets.push((name, builder.signed::<Pouf1>(delegation_key).unwrap()));
+        }
+
+        let mut remote = EphemeralRepository::<Pouf1>::new();
+        let mut builder = RepoBuilder::create(&mut remote)
+            .trusted_root_keys(&[&KEYS[0]])
+            .trusted_targets_keys(&[&KEYS[0]])
+            .trusted_snapshot_keys(&[&KEYS[0]])
+            .trusted_timestamp_keys(&[&KEYS[0]])
+            .stage_root()
+            .unwrap()
+            .add_delegation_key(delegation_key.public().clone());
+        for delegation in delegations {
+            builder = builder.add_delegation_role(delegation);
+        }
+        let metadata = builder
+            .stage_targets()
+            .unwrap()
+            .stage_snapshot_with_builder(|mut builder| {
+                for (name, targets) in &delegated_targets {
+                    builder = builder
+                        .insert_metadata_with_path(
+                            name.as_str().to_owned(),
+                            targets,
+                            &[HashAlgorithm::Sha256],
+                        )
+                        .unwrap();
+                }
+                builder
+            })
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+
+        for (name, targets) in &delegated_targets {
+            let raw = targets.to_raw().unwrap();
+            remote
+                .store_metadata(name, MetadataVersion::Number(1), &mut raw.as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut client = Client::with_trusted_root(
+            Config::default(),
+            metadata.root().unwrap(),
+            EphemeralRepository::new(),
+            remote,
+        )
+        .await
+        .unwrap();
+
+        assert_matches!(client.update().await, Ok(true));
+
+        client
+            .fetch_target_description(&TargetPath::new(path).unwrap())
+            .await
     }
 
     #[test]
