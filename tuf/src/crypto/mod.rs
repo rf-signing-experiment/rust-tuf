@@ -4,11 +4,8 @@ use {
     data_encoding::HEXLOWER,
     futures_io::AsyncRead,
     futures_util::AsyncReadExt as _,
-    ring::{
-        digest::{self, SHA256, SHA512},
-        signature::VerificationAlgorithm,
-    },
     serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeserializeError},
+    sha2::{Digest as _, Sha256, Sha512},
     spki::{
         AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicKeyInfoOwned,
         SubjectPublicKeyInfoRef,
@@ -107,7 +104,7 @@ pub fn retain_supported_hashes(
 pub(crate) fn calculate_hash(data: &[u8], hash_alg: &HashAlgorithm) -> HashValue {
     let mut context = hash_alg.digest_context().unwrap();
     context.update(data);
-    HashValue::new(context.finish().as_ref().to_vec())
+    HashValue::new(context.finish())
 }
 
 /// Calculate the size and hash digest from a given `AsyncRead`.
@@ -126,10 +123,7 @@ pub fn calculate_hashes_from_slice(
         let mut context = alg.digest_context()?;
         context.update(buf);
 
-        hashes.insert(
-            alg.clone(),
-            HashValue::new(context.finish().as_ref().to_vec()),
-        );
+        hashes.insert(alg.clone(), HashValue::new(context.finish()));
     }
 
     Ok(hashes)
@@ -175,7 +169,7 @@ where
 
     let hashes = hashes
         .drain()
-        .map(|(k, v)| (k.clone(), HashValue::new(v.finish().as_ref().to_vec())))
+        .map(|(k, v)| (k.clone(), HashValue::new(v.finish())))
         .collect();
     Ok((size, hashes))
 }
@@ -277,10 +271,7 @@ impl KeyAlgorithm {
 
     /// The algorithm a signature made by this key under `scheme` is checked with, or `None` if
     /// this crate cannot check that pairing.
-    fn verification_algorithm(
-        self,
-        scheme: &SignatureScheme,
-    ) -> Option<&'static dyn VerificationAlgorithm> {
+    fn verification_algorithm(self, scheme: &SignatureScheme) -> Option<VerificationAlgorithm> {
         (self.spec().verification)(scheme)
     }
 
@@ -321,11 +312,17 @@ struct AlgorithmSpec {
 
     /// The algorithm a signature made under some scheme is checked with, if these keys can sign
     /// that way. Teaching an algorithm a further scheme is a matter for this function alone.
-    verification: fn(&SignatureScheme) -> Option<&'static dyn VerificationAlgorithm>,
+    verification: fn(&SignatureScheme) -> Option<VerificationAlgorithm>,
 
     /// Check that some bytes are shaped like a public key of this algorithm.
     check_public_key: fn(&[u8]) -> Result<()>,
 }
+
+/// Check a signature over a message against a public key, given in the form its algorithm defines.
+///
+/// Any failure, including key material the algorithm refuses to use, means the signature is not
+/// valid.
+type VerificationAlgorithm = fn(public: &[u8], msg: &[u8], sig: &[u8]) -> signature::Result<()>;
 
 /// The parameters of a key algorithm's `AlgorithmIdentifier`.
 ///
@@ -371,10 +368,7 @@ impl AlgorithmParameters {
 fn calculate_key_id(algorithm: KeyAlgorithm, public_key: &[u8]) -> Result<KeyId> {
     let bytes = write_spki(public_key, algorithm)?;
 
-    let mut context = digest::Context::new(&SHA256);
-    context.update(&bytes);
-
-    Ok(KeyId(HEXLOWER.encode(context.finish().as_ref())))
+    Ok(KeyId(HEXLOWER.encode(&Sha256::digest(&bytes))))
 }
 
 /// Wrapper type for a public key's ID.
@@ -657,12 +651,9 @@ impl PublicKey {
     /// is how a [pouf](crate::pouf::Pouf) carries a key whose type or encoding it does not
     /// understand without making the rest of the metadata unreadable.
     pub fn opaque(typ: KeyType, scheme: SignatureScheme, value: Vec<u8>) -> Self {
-        let mut context = digest::Context::new(&SHA256);
-        context.update(&value);
-
         PublicKey {
             typ,
-            key_id: KeyId(HEXLOWER.encode(context.finish().as_ref())),
+            key_id: KeyId(HEXLOWER.encode(&Sha256::digest(&value))),
             scheme,
             value: PublicKeyValue::Opaque(value),
         }
@@ -774,11 +765,12 @@ impl PublicKey {
 
     /// Use this key to verify a message with a signature.
     pub fn verify(&self, role: &MetadataPath, msg: &[u8], sig: &Signature) -> Result<()> {
-        self.verify_bytes(msg, &sig.value.0).map_err(|err| match err {
-            // The caller knows which role this was, and the error should say so.
-            Error::SignatureVerificationFailed => Error::BadSignature(role.clone()),
-            other => other,
-        })
+        self.verify_bytes(msg, &sig.value.0)
+            .map_err(|err| match err {
+                // The caller knows which role this was, and the error should say so.
+                Error::SignatureVerificationFailed => Error::BadSignature(role.clone()),
+                other => other,
+            })
     }
 
     /// Use this key to verify a detached signature over `msg`.
@@ -807,9 +799,7 @@ impl PublicKey {
             });
         };
 
-        ring::signature::UnparsedPublicKey::new(verification, bytes)
-            .verify(msg, sig)
-            .map_err(|_| Error::SignatureVerificationFailed)
+        verification(bytes, msg, sig).map_err(|_| Error::SignatureVerificationFailed)
     }
 }
 
@@ -919,16 +909,40 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
-    /// Create a new `digest::Context` suitable for computing the hash of some data using this hash
+    /// Create a new `DigestContext` suitable for computing the hash of some data using this hash
     /// algorithm.
-    pub(crate) fn digest_context(&self) -> Result<digest::Context> {
+    pub(crate) fn digest_context(&self) -> Result<DigestContext> {
         match self {
-            HashAlgorithm::Sha256 => Ok(digest::Context::new(&SHA256)),
-            HashAlgorithm::Sha512 => Ok(digest::Context::new(&SHA512)),
+            HashAlgorithm::Sha256 => Ok(DigestContext::Sha256(Sha256::new())),
+            HashAlgorithm::Sha512 => Ok(DigestContext::Sha512(Sha512::new())),
             HashAlgorithm::Unknown(s) => Err(Error::IllegalArgument(format!(
                 "Unknown hash algorithm: {}",
                 s
             ))),
+        }
+    }
+}
+
+/// An in-progress hash computation for one of the supported [`HashAlgorithm`]s.
+pub(crate) enum DigestContext {
+    Sha256(Sha256),
+    Sha512(Sha512),
+}
+
+impl DigestContext {
+    /// Feed more data into the hash.
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        match self {
+            DigestContext::Sha256(context) => context.update(data),
+            DigestContext::Sha512(context) => context.update(data),
+        }
+    }
+
+    /// Finish the hash and return the digest.
+    pub(crate) fn finish(self) -> Vec<u8> {
+        match self {
+            DigestContext::Sha256(context) => context.finalize().to_vec(),
+            DigestContext::Sha512(context) => context.finalize().to_vec(),
         }
     }
 }
@@ -1027,12 +1041,9 @@ mod test {
     fn key_id_is_derived_from_the_key_material() {
         let key = PublicKey::from_ed25519(ed25519::PUBLIC_KEY).unwrap();
 
-        let mut context = digest::Context::new(&SHA256);
-        context.update(&key.as_spki().unwrap());
-
         assert_eq!(
             key.key_id(),
-            &KeyId::from_str(&HEXLOWER.encode(context.finish().as_ref())).unwrap(),
+            &KeyId::from_str(&HEXLOWER.encode(&Sha256::digest(key.as_spki().unwrap()))).unwrap(),
         );
 
         // Reading the same key back out of any encoding names it the same way.

@@ -1,12 +1,16 @@
 //! RSA keys, as defined in [RFC 8017](https://datatracker.ietf.org/doc/html/rfc8017).
 
 use {
-    ring::{
-        rand::SystemRandom,
-        signature::{
-            KeyPair, RSA_PSS_2048_8192_SHA256, RSA_PSS_SHA256, RsaKeyPair, VerificationAlgorithm,
-        },
+    getrandom::SysRng,
+    rsa::{
+        RsaPublicKey,
+        pkcs1::{DecodeRsaPublicKey as _, EncodeRsaPublicKey as _},
+        pkcs8::DecodePrivateKey as _,
+        pss,
+        traits::PublicKeyParts as _,
     },
+    sha2::Sha256,
+    signature::{RandomizedSigner as _, SignatureEncoding as _, Verifier as _},
     spki::{
         ObjectIdentifier,
         der::{Decode as _, Tag, Tagged as _, asn1::Any},
@@ -15,13 +19,19 @@ use {
 
 use super::{
     AlgorithmParameters, AlgorithmSpec, KeyType, PrivateKey, PublicKey, Signature, SignatureScheme,
-    SignatureValue,
+    SignatureValue, VerificationAlgorithm,
 };
 use crate::error::{Error, Result};
 
 /// `rsaEncryption` as defined in
 /// [RFC 4055 §1.2](https://datatracker.ietf.org/doc/html/rfc4055#section-1.2).
 const RSA_ENCRYPTION_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+
+/// The smallest modulus, in bits, this crate will sign or verify a signature with.
+const MIN_MODULUS_BITS: u32 = 2048;
+
+/// The largest modulus, in bits, this crate will verify a signature with.
+const MAX_MODULUS_BITS: u32 = 8192;
 
 pub(super) static SPEC: AlgorithmSpec = AlgorithmSpec {
     name: "rsa",
@@ -36,13 +46,26 @@ pub(super) static SPEC: AlgorithmSpec = AlgorithmSpec {
 
 /// RSA keys sign under a family of schemes, of which this crate implements one. The others differ
 /// only in padding and digest, and cost an arm here rather than a key algorithm of their own.
-fn verification(scheme: &SignatureScheme) -> Option<&'static dyn VerificationAlgorithm> {
+fn verification(scheme: &SignatureScheme) -> Option<VerificationAlgorithm> {
     match *scheme {
-        // RSASSA-PSS with SHA-256 throughout, and a salt as long as the digest, which is what the
-        // rest of the TUF ecosystem produces for this scheme.
-        SignatureScheme::RsassaPssSha256 => Some(&RSA_PSS_2048_8192_SHA256),
+        SignatureScheme::RsassaPssSha256 => Some(verify_pss_sha256),
         _ => None,
     }
+}
+
+/// RSASSA-PSS with SHA-256 throughout, and a salt as long as the digest, which is what the rest
+/// of the TUF ecosystem produces for this scheme.
+fn verify_pss_sha256(public: &[u8], msg: &[u8], sig: &[u8]) -> signature::Result<()> {
+    let public = RsaPublicKey::from_pkcs1_der(public).map_err(signature::Error::from_source)?;
+
+    let bits = public.n().bits();
+    if !(MIN_MODULUS_BITS..=MAX_MODULUS_BITS).contains(&bits) {
+        return Err(signature::Error::new());
+    }
+
+    let sig = pss::Signature::try_from(sig)?;
+
+    pss::VerifyingKey::<Sha256>::new(public).verify(msg, &sig)
 }
 
 /// An RSA public key is a PKCS#1 `RSAPublicKey`, whose length depends on the size of the modulus.
@@ -67,9 +90,8 @@ fn check_public_key(public: &[u8]) -> Result<()> {
 
 /// A structure containing information about an RSA private key.
 pub struct RsaPrivateKey {
-    private: RsaKeyPair,
+    private: pss::BlindedSigningKey<Sha256>,
     public: PublicKey,
-    rng: SystemRandom,
 }
 
 impl RsaPrivateKey {
@@ -96,30 +118,42 @@ impl RsaPrivateKey {
             }
         }
 
-        let private = RsaKeyPair::from_pkcs8(der_key)
+        let private = rsa::RsaPrivateKey::from_pkcs8_der(der_key)
             .map_err(|err| Error::Encoding(format!("Could not parse key as PKCS#8v1: {}", err)))?;
 
-        let public = PublicKey::new(KeyType::Rsa, scheme, private.public_key().as_ref().to_vec())?;
+        let bits = private.n().bits();
+        if bits < MIN_MODULUS_BITS {
+            return Err(Error::IllegalArgument(format!(
+                "rsa private keys must be at least {} bits, got {}",
+                MIN_MODULUS_BITS, bits,
+            )));
+        }
+
+        let public_bytes = private
+            .to_public_key()
+            .to_pkcs1_der()
+            .map_err(|err| Error::Encoding(format!("Could not write RSAPublicKey: {}", err)))?;
+
+        let public = PublicKey::new(KeyType::Rsa, scheme, public_bytes.into_vec())?;
 
         Ok(RsaPrivateKey {
-            private,
+            // Blinding keeps the time signing takes from depending on the private key.
+            private: pss::BlindedSigningKey::new(private),
             public,
-            rng: SystemRandom::new(),
         })
     }
 }
 
 impl PrivateKey for RsaPrivateKey {
     fn sign(&self, msg: &[u8]) -> Result<Signature> {
-        let mut value = vec![0; self.private.public().modulus_len()];
-
-        self.private
-            .sign(&RSA_PSS_SHA256, &self.rng, msg, &mut value)
+        let value = self
+            .private
+            .try_sign_with_rng(&mut SysRng, msg)
             .map_err(|_| Error::Opaque("Failed to sign message".into()))?;
 
         Ok(Signature {
             key_id: self.public.key_id().clone(),
-            value: SignatureValue(value),
+            value: SignatureValue(value.to_vec()),
         })
     }
 

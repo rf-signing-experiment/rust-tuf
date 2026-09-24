@@ -1,13 +1,12 @@
 use futures_io::AsyncRead;
 use futures_util::ready;
-use ring::digest;
 use std::io::{self, ErrorKind};
 use std::marker::Unpin;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::Result;
-use crate::crypto::{HashAlgorithm, HashValue};
+use crate::crypto::{DigestContext, HashAlgorithm, HashValue};
 
 /// Wrapper to verify a byte stream as it is read.
 ///
@@ -22,7 +21,7 @@ use crate::crypto::{HashAlgorithm, HashValue};
 pub(crate) struct EnforceSizeAndHash<R> {
     inner: R,
     max_size: u64,
-    hashers: Vec<(digest::Context, HashValue)>,
+    hashers: Vec<(DigestContext, HashValue)>,
     bytes_read: u64,
 }
 
@@ -63,7 +62,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for EnforceSizeAndHash<R> {
         if read_bytes == 0 {
             for (context, expected_hash) in self.hashers.drain(..) {
                 let generated_hash = context.finish();
-                if generated_hash.as_ref() != expected_hash.value() {
+                if generated_hash != expected_hash.value() {
                     return Poll::Ready(Err(io::Error::new(
                         ErrorKind::InvalidData,
                         "Calculated hash did not match the required hash.",
@@ -97,7 +96,7 @@ mod test {
     use super::*;
     use futures_executor::block_on;
     use futures_util::io::AsyncReadExt;
-    use ring::digest::SHA256;
+    use sha2::{Digest as _, Sha256};
 
     #[test]
     fn valid_read() {
@@ -159,9 +158,7 @@ mod test {
     fn valid_read_good_hash() {
         block_on(async {
             let bytes: &[u8] = &[0x00, 0x01, 0x02, 0x03];
-            let mut context = digest::Context::new(&SHA256);
-            context.update(bytes);
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(Sha256::digest(bytes).to_vec());
             let mut reader = EnforceSizeAndHash::new(
                 bytes,
                 bytes.len() as u64,
@@ -178,10 +175,13 @@ mod test {
     fn invalid_read_bad_hash() {
         block_on(async {
             let bytes: &[u8] = &[0x00, 0x01, 0x02, 0x03];
-            let mut context = digest::Context::new(&SHA256);
-            context.update(bytes);
-            context.update(&[0xFF]); // evil bytes
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(
+                Sha256::new()
+                    .chain_update(bytes)
+                    .chain_update([0xFF]) // evil bytes
+                    .finalize()
+                    .to_vec(),
+            );
             let mut reader = EnforceSizeAndHash::new(
                 bytes,
                 bytes.len() as u64,
@@ -197,9 +197,7 @@ mod test {
     fn valid_read_good_hash_large_data() {
         block_on(async {
             let bytes: &[u8] = &[0x00; 64 * 1024];
-            let mut context = digest::Context::new(&SHA256);
-            context.update(bytes);
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(Sha256::digest(bytes).to_vec());
             let mut reader = EnforceSizeAndHash::new(
                 bytes,
                 bytes.len() as u64,
@@ -216,10 +214,13 @@ mod test {
     fn invalid_read_bad_hash_large_data() {
         block_on(async {
             let bytes: &[u8] = &[0x00; 64 * 1024];
-            let mut context = digest::Context::new(&SHA256);
-            context.update(bytes);
-            context.update(&[0xFF]); // evil bytes
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(
+                Sha256::new()
+                    .chain_update(bytes)
+                    .chain_update([0xFF]) // evil bytes
+                    .finalize()
+                    .to_vec(),
+            );
             let mut reader = EnforceSizeAndHash::new(
                 bytes,
                 bytes.len() as u64,
