@@ -606,7 +606,7 @@ async fn init_server<D: Pouf + Clone>(
     Ok((vec![root_key.public().clone()], root))
 }
 
-async fn init_client<D: Pouf + Clone>(
+async fn init_client<D: Pouf + Clone + Send + Sync>(
     root_public_keys: &[PublicKey],
     remote: EphemeralRepository<D>,
 ) -> Result<()> {
@@ -630,7 +630,7 @@ async fn init_client<D: Pouf + Clone>(
 
 /// A repository signed with these keys can be published and then consumed by a client, all the
 /// way through to fetching a target.
-async fn round_trip<D: Pouf + Clone>(keys: Keys, consistent_snapshot: bool) {
+async fn round_trip<D: Pouf + Clone + Send + Sync>(keys: Keys, consistent_snapshot: bool) {
     let mut remote = EphemeralRepository::<D>::new();
     let (root_public_keys, _) = init_server(&mut remote, keys, consistent_snapshot)
         .await

@@ -827,7 +827,16 @@ where
             Ok(false)
         }
     }
+}
 
+// Fetching targets walks the delegation graph recursively through a boxed
+// `Send` future, which needs the client's parts to be `Send + Sync`.
+impl<D, L, R> Client<D, L, R>
+where
+    D: Pouf + Send + Sync,
+    L: RepositoryProvider<D> + RepositoryStorage<D> + Send + Sync,
+    R: RepositoryProvider<D> + Send + Sync,
+{
     /// Fetch a target from the remote repo.
     ///
     /// It is **critical** that none of the bytes written to the `write` are used until this future
@@ -947,174 +956,184 @@ where
         target_description
     }
 
-    async fn lookup_target_description(
-        &mut self,
-        start_time: &DateTime<Utc>,
+    fn lookup_target_description<'a>(
+        &'a mut self,
+        start_time: &'a DateTime<Utc>,
         default_terminate: bool,
         current_depth: u32,
-        target: &TargetPath,
-        snapshot: &SnapshotMetadata,
-        targets: Option<(&Verified<TargetsMetadata>, MetadataPath)>,
-    ) -> (bool, Result<TargetDescription>) {
-        if current_depth > self.config.max_delegation_depth {
-            warn!(
-                "Walking the delegation graph would have exceeded the configured max depth: {}",
-                self.config.max_delegation_depth
-            );
-            return (
-                default_terminate,
-                Err(Error::TargetNotFound(target.clone())),
-            );
-        }
-
-        // these clones are dumb, but we need immutable values and not references for update
-        // tuf in the loop below
-        let (targets, targets_role) = match targets {
-            Some((t, role)) => (t.clone(), role),
-            None => match self.tuf.trusted_targets() {
-                Some(t) => (t.clone(), MetadataPath::targets()),
-                None => {
-                    return (
-                        default_terminate,
-                        Err(Error::MetadataNotFound {
-                            path: MetadataPath::targets(),
-                            version: MetadataVersion::None,
-                        }),
-                    );
-                }
-            },
-        };
-
-        if let Some(t) = targets.targets().get(target) {
-            return (default_terminate, Ok(t.clone()));
-        }
-
-        for delegation in targets.delegations().roles() {
-            if !delegation.paths().iter().any(|p| target == p || target.is_child(p)) {
-                continue;
+        target: &'a TargetPath,
+        snapshot: &'a SnapshotMetadata,
+        targets: Option<(&'a Verified<TargetsMetadata>, MetadataPath)>,
+    ) -> Pin<Box<dyn Future<Output = (bool, Result<TargetDescription>)> + Send + 'a>> {
+        Box::pin(async move {
+            if current_depth > self.config.max_delegation_depth {
+                warn!(
+                    "Walking the delegation graph would have exceeded the configured max depth: {}",
+                    self.config.max_delegation_depth
+                );
+                return (
+                    default_terminate,
+                    Err(Error::TargetNotFound(target.clone())),
+                );
             }
 
-            let role_meta = match snapshot.meta().get(delegation.name()) {
-                Some(m) => m,
-                None if delegation.terminating() => {
-                    return (true, Err(Error::TargetNotFound(target.clone())));
-                }
-                None => {
+            // these clones are dumb, but we need immutable values and not references for update
+            // tuf in the loop below
+            let (targets, targets_role) = match targets {
+                Some((t, role)) => (t.clone(), role),
+                None => match self.tuf.trusted_targets() {
+                    Some(t) => (t.clone(), MetadataPath::targets()),
+                    None => {
+                        return (
+                            default_terminate,
+                            Err(Error::MetadataNotFound {
+                                path: MetadataPath::targets(),
+                                version: MetadataVersion::None,
+                            }),
+                        );
+                    }
+                },
+            };
+
+            if let Some(t) = targets.targets().get(target) {
+                return (default_terminate, Ok(t.clone()));
+            }
+
+            for delegation in targets.delegations().roles() {
+                if !delegation
+                    .paths()
+                    .iter()
+                    .any(|p| target == p || target.is_child(p))
+                {
                     continue;
                 }
-            };
 
-            /////////////////////////////////////////
-            // TUF-1.0.9 §5.4:
-            //
-            //     Download the top-level targets metadata file, up to either the number of bytes
-            //     specified in the snapshot metadata file, or some Z number of bytes. The value
-            //     for Z is set by the authors of the application using TUF. For example, Z may be
-            //     tens of kilobytes. If consistent snapshots are not used (see Section 7), then
-            //     the filename used to download the targets metadata file is of the fixed form
-            //     FILENAME.EXT (e.g., targets.json). Otherwise, the filename is of the form
-            //     VERSION_NUMBER.FILENAME.EXT (e.g., 42.targets.json), where VERSION_NUMBER is the
-            //     version number of the targets metadata file listed in the snapshot metadata
-            //     file.
-
-            let version = if self.tuf.trusted_root().consistent_snapshot() {
-                MetadataVersion::Number(role_meta.version())
-            } else {
-                MetadataVersion::None
-            };
-
-            let role_length = role_meta.length().or(self.config.max_targets_length);
-
-            // https://theupdateframework.github.io/specification/v1.0.26/#update-targets
-            //
-            //     [...] The hashes of the new targets metadata file MUST match the hashes, if
-            //      any, listed in the trusted snapshot metadata.
-            let role_hashes = crypto::retain_supported_hashes(role_meta.hashes());
-
-            let raw_signed_meta = match self
-                .remote
-                .fetch_metadata(delegation.name(), version, role_length, role_hashes)
-                .await
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to fetch metadata {:?}: {:?}", delegation.name(), e);
-                    if delegation.terminating() {
-                        return (true, Err(e));
-                    } else {
+                let role_meta = match snapshot.meta().get(delegation.name()) {
+                    Some(m) => m,
+                    None if delegation.terminating() => {
+                        return (true, Err(Error::TargetNotFound(target.clone())));
+                    }
+                    None => {
                         continue;
                     }
-                }
-            };
+                };
 
-            match self.tuf.update_delegated_targets(
-                start_time,
-                &targets_role,
-                delegation.name(),
-                &raw_signed_meta,
-            ) {
-                Ok(_) => {
-                    /////////////////////////////////////////
-                    // TUF-1.0.9 §5.4.4:
-                    //
-                    //     Persist targets metadata. The client MUST write the file to non-volatile
-                    //     storage as FILENAME.EXT (e.g. targets.json).
+                /////////////////////////////////////////
+                // TUF-1.0.9 §5.4:
+                //
+                //     Download the top-level targets metadata file, up to either the number of bytes
+                //     specified in the snapshot metadata file, or some Z number of bytes. The value
+                //     for Z is set by the authors of the application using TUF. For example, Z may be
+                //     tens of kilobytes. If consistent snapshots are not used (see Section 7), then
+                //     the filename used to download the targets metadata file is of the fixed form
+                //     FILENAME.EXT (e.g., targets.json). Otherwise, the filename is of the form
+                //     VERSION_NUMBER.FILENAME.EXT (e.g., 42.targets.json), where VERSION_NUMBER is the
+                //     version number of the targets metadata file listed in the snapshot metadata
+                //     file.
 
-                    match self
-                        .local
-                        .store_metadata(delegation.name(), MetadataVersion::None, &raw_signed_meta)
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            warn!(
-                                "Error storing metadata {:?} locally: {:?}",
-                                delegation.name(),
-                                e
-                            )
+                let version = if self.tuf.trusted_root().consistent_snapshot() {
+                    MetadataVersion::Number(role_meta.version())
+                } else {
+                    MetadataVersion::None
+                };
+
+                let role_length = role_meta.length().or(self.config.max_targets_length);
+
+                // https://theupdateframework.github.io/specification/v1.0.26/#update-targets
+                //
+                //     [...] The hashes of the new targets metadata file MUST match the hashes, if
+                //      any, listed in the trusted snapshot metadata.
+                let role_hashes = crypto::retain_supported_hashes(role_meta.hashes());
+
+                let raw_signed_meta = match self
+                    .remote
+                    .fetch_metadata(delegation.name(), version, role_length, role_hashes)
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("Failed to fetch metadata {:?}: {:?}", delegation.name(), e);
+                        if delegation.terminating() {
+                            return (true, Err(e));
+                        } else {
+                            continue;
                         }
                     }
+                };
 
-                    let meta = match self.tuf.trusted_delegations().get(delegation.name()) {
-                        Some(m) => m.clone(),
-                        None => {
-                            let err = Error::MetadataNotFound {
-                                path: delegation.name().clone(),
-                                version: MetadataVersion::None,
-                            };
-                            if delegation.terminating() {
-                                return (true, Err(err));
-                            } else {
-                                continue;
+                match self.tuf.update_delegated_targets(
+                    start_time,
+                    &targets_role,
+                    delegation.name(),
+                    &raw_signed_meta,
+                ) {
+                    Ok(_) => {
+                        /////////////////////////////////////////
+                        // TUF-1.0.9 §5.4.4:
+                        //
+                        //     Persist targets metadata. The client MUST write the file to non-volatile
+                        //     storage as FILENAME.EXT (e.g. targets.json).
+
+                        match self
+                            .local
+                            .store_metadata(
+                                delegation.name(),
+                                MetadataVersion::None,
+                                &raw_signed_meta,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                warn!(
+                                    "Error storing metadata {:?} locally: {:?}",
+                                    delegation.name(),
+                                    e
+                                )
                             }
                         }
-                    };
-                    let f: Pin<Box<dyn Future<Output = _>>> =
-                        Box::pin(self.lookup_target_description(
-                            start_time,
-                            delegation.terminating(),
-                            current_depth + 1,
-                            target,
-                            snapshot,
-                            Some((&meta, delegation.name().clone())),
-                        ));
-                    let (term, res) = f.await;
 
-                    // Stop at the first delegation that finds the target, or that ends the search
-                    // because it's terminating.
-                    if term || res.is_ok() {
-                        return (term, res);
+                        let meta = match self.tuf.trusted_delegations().get(delegation.name()) {
+                            Some(m) => m.clone(),
+                            None => {
+                                let err = Error::MetadataNotFound {
+                                    path: delegation.name().clone(),
+                                    version: MetadataVersion::None,
+                                };
+                                if delegation.terminating() {
+                                    return (true, Err(err));
+                                } else {
+                                    continue;
+                                }
+                            }
+                        };
+                        let (term, res) = self
+                            .lookup_target_description(
+                                start_time,
+                                delegation.terminating(),
+                                current_depth + 1,
+                                target,
+                                snapshot,
+                                Some((&meta, delegation.name().clone())),
+                            )
+                            .await;
+
+                        // Stop at the first delegation that finds the target, or that ends the search
+                        // because it's terminating.
+                        if term || res.is_ok() {
+                            return (term, res);
+                        }
                     }
-                }
-                Err(_) if !delegation.terminating() => continue,
-                Err(e) => return (true, Err(e)),
-            };
-        }
+                    Err(_) if !delegation.terminating() => continue,
+                    Err(e) => return (true, Err(e)),
+                };
+            }
 
-        (
-            default_terminate,
-            Err(Error::TargetNotFound(target.clone())),
-        )
+            (
+                default_terminate,
+                Err(Error::TargetNotFound(target.clone())),
+            )
+        })
     }
 }
 
