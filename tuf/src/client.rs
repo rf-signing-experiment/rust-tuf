@@ -1089,7 +1089,7 @@ where
                             }
                         }
                     };
-                    let f: Pin<Box<dyn Future<Output = _>>> =
+                    let f: Pin<Box<dyn Future<Output = (bool, Result<TargetDescription>)> + '_>> =
                         Box::pin(self.lookup_target_description(
                             start_time,
                             delegation.terminating(),
