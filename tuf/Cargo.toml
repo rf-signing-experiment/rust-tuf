@@ -5,7 +5,6 @@ version = "0.3.0-beta15"
 rust-version = "1.88.0"
 authors = [ "heartsucker <heartsucker@autistici.org>", "Erick Tryzelaar <etryzelaar@google.com>" ]
 description = "Library for The Update Framework (TUF)"
-homepage = "https://github.com/theupdateframework/rust-tuf"
 repository = "https://github.com/theupdateframework/rust-tuf"
 documentation = "https://docs.rs/tuf"
 readme = "README.md"

@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.88.0"
 authors = [ "Erick Tryzelaar <etryzelaar@google.com>" ]
 description = "HTTP repository support for TUF using Hyper"
-homepage = "https://github.com/theupdateframework/rust-tuf"
 repository = "https://github.com/theupdateframework/rust-tuf"
 license = "MIT/Apache-2.0"
 

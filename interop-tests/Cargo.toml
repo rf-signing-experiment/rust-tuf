@@ -3,7 +3,6 @@ name = "interop-tests"
 version = "0.1.1"
 authors = [ "heartsucker <heartsucker@autistici.org>", "Erick Tryzelaar <etryzelaar@google.com>" ]
 description = "TUF library interoperation tests"
-homepage = "https://github.com/theupdateframework/rust-tuf"
 repository = "https://github.com/theupdateframework/rust-tuf"
 edition = "2024"
 readme = "README.md"
