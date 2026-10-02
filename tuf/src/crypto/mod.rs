@@ -11,7 +11,7 @@ use {
         SubjectPublicKeyInfoRef,
         der::{
             Decode as _, Encode as _,
-            asn1::{Any, BitString, Null},
+            asn1::{Any, BitString},
             pem::{self, LineEnding, PemLabel as _},
         },
     },
@@ -324,9 +324,6 @@ enum AlgorithmParameters {
     /// The parameters must be absent.
     Absent,
 
-    /// The parameters must be present, and must be `NULL`.
-    Null,
-
     /// The parameters name something, such as the curve an elliptic curve key lies on.
     Oid(ObjectIdentifier),
 }
@@ -337,7 +334,7 @@ impl AlgorithmParameters {
     /// An explicit `NULL` reads back the same as absent parameters, so both are `None` here.
     fn oid(&self) -> Option<ObjectIdentifier> {
         match *self {
-            AlgorithmParameters::Absent | AlgorithmParameters::Null => None,
+            AlgorithmParameters::Absent => None,
             AlgorithmParameters::Oid(oid) => Some(oid),
         }
     }
@@ -346,7 +343,6 @@ impl AlgorithmParameters {
     fn encode(&self) -> Result<Option<Any>> {
         match *self {
             AlgorithmParameters::Absent => Ok(None),
-            AlgorithmParameters::Null => Any::encode_from(&Null).map(Some).map_err(spki_error),
             AlgorithmParameters::Oid(oid) => Any::encode_from(&oid).map(Some).map_err(spki_error),
         }
     }
