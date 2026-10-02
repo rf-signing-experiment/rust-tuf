@@ -1,19 +1,19 @@
 //! ECDSA keys over the NIST prime curves.
 
 use {
-    ring::{
-        rand::SystemRandom,
-        signature::{
-            ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair,
-            EcdsaSigningAlgorithm, KeyPair, VerificationAlgorithm,
-        },
+    getrandom::SysRng,
+    p256::{
+        ecdsa::{DerSignature, SigningKey, VerifyingKey},
+        elliptic_curve::Generate as _,
+        pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
     },
+    signature::{RandomizedSigner as _, SignatureEncoding as _, Verifier as _},
     spki::ObjectIdentifier,
 };
 
 use super::{
     AlgorithmParameters, AlgorithmSpec, KeyType, PrivateKey, PublicKey, Signature, SignatureScheme,
-    SignatureValue,
+    SignatureValue, VerificationAlgorithm,
 };
 use crate::error::{Error, Result};
 
@@ -44,13 +44,20 @@ pub(super) static NIST_P256_SPEC: AlgorithmSpec = AlgorithmSpec {
     check_public_key: check_p256_public_key,
 };
 
-fn p256_verification(scheme: &SignatureScheme) -> Option<&'static dyn VerificationAlgorithm> {
+fn p256_verification(scheme: &SignatureScheme) -> Option<VerificationAlgorithm> {
     match *scheme {
-        // TUF writes an ECDSA signature as the ASN.1 `Ecdsa-Sig-Value` of RFC 3279 §2.2.3, not
-        // as the fixed width concatenation of `r` and `s`.
-        SignatureScheme::EcdsaSha2NistP256 => Some(&ECDSA_P256_SHA256_ASN1),
+        SignatureScheme::EcdsaSha2NistP256 => Some(verify_p256_sha256_asn1),
         _ => None,
     }
+}
+
+/// TUF writes an ECDSA signature as the ASN.1 `Ecdsa-Sig-Value` of RFC 3279 §2.2.3, not as the
+/// fixed width concatenation of `r` and `s`.
+fn verify_p256_sha256_asn1(public: &[u8], msg: &[u8], sig: &[u8]) -> signature::Result<()> {
+    let public = VerifyingKey::from_sec1_bytes(public)?;
+    let sig = DerSignature::from_bytes(sig)?;
+
+    public.verify(msg, &sig)
 }
 
 /// An elliptic curve public key is the uncompressed point of SEC 1 §2.3.3: the tag byte, then `x`
@@ -86,9 +93,8 @@ impl PublicKey {
 
 /// A structure containing information about an ECDSA private key.
 pub struct EcdsaPrivateKey {
-    private: EcdsaKeyPair,
+    private: SigningKey,
     public: PublicKey,
-    rng: SystemRandom,
 }
 
 impl EcdsaPrivateKey {
@@ -96,15 +102,20 @@ impl EcdsaPrivateKey {
     ///
     /// The scheme names the curve the key is generated on, and must be an ECDSA scheme.
     pub fn pkcs8(scheme: &SignatureScheme) -> Result<Vec<u8>> {
-        EcdsaKeyPair::generate_pkcs8(signing_algorithm(scheme)?, &SystemRandom::new())
-            .map(|bytes| bytes.as_ref().to_vec())
-            .map_err(|_| Error::Opaque(format!("Failed to generate {} key", scheme)))
+        check_scheme(scheme)?;
+
+        let key = SigningKey::try_generate_from_rng(&mut SysRng)
+            .map_err(|_| Error::Opaque(format!("Failed to generate {} key", scheme)))?;
+
+        key.to_pkcs8_der()
+            .map(|doc| doc.as_bytes().to_vec())
+            .map_err(|err| Error::Encoding(format!("Could not write key as PKCS#8v1: {}", err)))
     }
 
     /// Create a private key from PKCS#8v1 DER bytes.
     ///
-    /// The document must carry the public key alongside the private one, and must name the same
-    /// curve that `scheme` does.
+    /// The document must name the same curve that `scheme` does. If it carries the public key
+    /// alongside the private one, the two must match.
     ///
     /// # Generating Keys
     ///
@@ -113,34 +124,37 @@ impl EcdsaPrivateKey {
     ///       -outform der -out ecdsa-private-key.pk8
     /// ```
     pub fn from_pkcs8(der_key: &[u8], scheme: SignatureScheme) -> Result<Self> {
-        let rng = SystemRandom::new();
-        let private = EcdsaKeyPair::from_pkcs8(signing_algorithm(&scheme)?, der_key, &rng)
+        check_scheme(&scheme)?;
+
+        let private = SigningKey::from_pkcs8_der(der_key)
             .map_err(|err| Error::Encoding(format!("Could not parse key as PKCS#8v1: {}", err)))?;
 
         let public = PublicKey::new(
             KeyType::Ecdsa,
             scheme,
-            private.public_key().as_ref().to_vec(),
+            private
+                .verifying_key()
+                .to_sec1_point(false)
+                .as_bytes()
+                .to_vec(),
         )?;
 
-        Ok(EcdsaPrivateKey {
-            private,
-            public,
-            rng,
-        })
+        Ok(EcdsaPrivateKey { private, public })
     }
 }
 
 impl PrivateKey for EcdsaPrivateKey {
     fn sign(&self, msg: &[u8]) -> Result<Signature> {
-        let value = self
+        // Signing with fresh randomness mixed into the RFC 6979 nonce keeps signatures randomized,
+        // as other implementations produce them.
+        let value: DerSignature = self
             .private
-            .sign(&self.rng, msg)
+            .try_sign_with_rng(&mut SysRng, msg)
             .map_err(|_| Error::Opaque("Failed to sign message".into()))?;
 
         Ok(Signature {
             key_id: self.public.key_id().clone(),
-            value: SignatureValue(value.as_ref().to_vec()),
+            value: SignatureValue(value.to_vec()),
         })
     }
 
@@ -149,10 +163,10 @@ impl PrivateKey for EcdsaPrivateKey {
     }
 }
 
-/// The ring algorithm that signs for the given scheme.
-fn signing_algorithm(scheme: &SignatureScheme) -> Result<&'static EcdsaSigningAlgorithm> {
+/// Check that `scheme` is one this crate can sign with using an ECDSA key.
+fn check_scheme(scheme: &SignatureScheme) -> Result<()> {
     match *scheme {
-        SignatureScheme::EcdsaSha2NistP256 => Ok(&ECDSA_P256_SHA256_ASN1_SIGNING),
+        SignatureScheme::EcdsaSha2NistP256 => Ok(()),
         SignatureScheme::Unknown(ref s) => Err(Error::UnknownSignatureScheme(s.clone())),
         ref scheme => Err(Error::IllegalArgument(format!(
             "{} is not an ECDSA signature scheme",
@@ -280,12 +294,10 @@ mod test {
             EcdsaPrivateKey::from_pkcs8(ecdsa::P256_PK8_1, SignatureScheme::EcdsaSha2NistP256)
                 .unwrap();
 
-        let mut context = digest::Context::new(&SHA256);
-        context.update(&key.public().as_spki().unwrap());
-
         assert_eq!(
             key.public().key_id(),
-            &KeyId::from_str(&HEXLOWER.encode(context.finish().as_ref())).unwrap(),
+            &KeyId::from_str(&HEXLOWER.encode(&Sha256::digest(key.public().as_spki().unwrap())))
+                .unwrap(),
         );
     }
 
