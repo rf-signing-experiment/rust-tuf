@@ -483,14 +483,12 @@ pub struct Delegations {
 
 impl Delegations {
     pub fn from_metadata<D: Pouf>(delegations: &metadata::Delegations) -> Result<Self> {
-        let mut roles = delegations
+        // Clients search roles in order, so keep the order they were given in.
+        let roles = delegations
             .roles()
             .iter()
             .map(Delegation::from)
             .collect::<Vec<Delegation>>();
-
-        // We want our roles in a consistent order.
-        roles.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
 
         Ok(Delegations {
             keys: encode_keys::<D>(delegations.keys())?,

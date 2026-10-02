@@ -4122,6 +4122,41 @@ mod test {
         assert!(RootMetadata::from_raw_data::<Pouf1>(&root).is_ok());
     }
 
+    // Roles keep their order, which is the order clients search them in.
+    #[test]
+    fn serde_delegations_keep_role_order() {
+        let key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8)
+            .unwrap()
+            .public()
+            .clone();
+        let role = |name: &str, path: &str| {
+            Delegation::new(
+                MetadataPath::new(name.to_owned()).unwrap(),
+                true,
+                MetadataThreshold::ONE,
+                hashset!(key.key_id().clone()),
+                hashset!(TargetPath::new(path.to_owned()).unwrap()),
+            )
+            .unwrap()
+        };
+        let delegations = Delegations::new(
+            hashmap! { key.key_id().clone() => key.clone() },
+            vec![role("b", "a/b/"), role("a", "a/")],
+        )
+        .unwrap();
+
+        let encoded = delegations.to_raw_data::<Pouf1>().unwrap();
+        let names: Vec<_> = encoded["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["b", "a"]);
+        let decoded = Delegations::from_raw_data::<Pouf1>(&encoded).unwrap();
+        assert_eq!(decoded, delegations);
+    }
+
     // Refuse to deserialize delegations with duplicated roles
     #[test]
     fn deserialize_json_delegations_duplicated_roles() {
