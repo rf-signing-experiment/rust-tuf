@@ -17,6 +17,7 @@ use std::str;
 use crate::Result;
 use crate::crypto::{self, HashAlgorithm, HashValue, KeyId, PrivateKey, PublicKey, Signature};
 use crate::error::Error;
+use crate::glob;
 use crate::pouf::Pouf;
 use crate::pouf::shims;
 
@@ -67,7 +68,6 @@ static PATH_ILLEGAL_STRINGS: &[&str] = &[
     ">",
     "\"",
     "|",
-    "?",
     // control characters, all illegal in FAT
     "\u{000}",
     "\u{001}",
@@ -105,6 +105,15 @@ static PATH_ILLEGAL_STRINGS: &[&str] = &[
 ];
 
 fn safe_path(path: &str) -> Result<()> {
+    if path.contains('?') {
+        return Err(Error::IllegalArgument("Path cannot contain \"?\"".into()));
+    }
+
+    safe_path_pattern(path)
+}
+
+/// Like [safe_path], but allows `?`, which is a wildcard in a [PathPattern].
+fn safe_path_pattern(path: &str) -> Result<()> {
     if path.is_empty() {
         return Err(Error::IllegalArgument("Path cannot be empty".into()));
     }
@@ -1607,62 +1616,6 @@ impl TargetPath {
         self.0.split('/').map(|s| s.to_string()).collect()
     }
 
-    /// Return whether this path is the child of another path.
-    ///
-    /// ```
-    /// # use tuf::metadata::TargetPath;
-    /// let path1 = TargetPath::new("foo").unwrap();
-    /// let path2 = TargetPath::new("foo/bar").unwrap();
-    /// assert!(!path2.is_child(&path1));
-    ///
-    /// let path1 = TargetPath::new("foo/").unwrap();
-    /// let path2 = TargetPath::new("foo/bar").unwrap();
-    /// assert!(path2.is_child(&path1));
-    ///
-    /// let path2 = TargetPath::new("foo/bar/baz").unwrap();
-    /// assert!(path2.is_child(&path1));
-    ///
-    /// let path2 = TargetPath::new("wat").unwrap();
-    /// assert!(!path2.is_child(&path1))
-    /// ```
-    pub fn is_child(&self, parent: &Self) -> bool {
-        if !parent.0.ends_with('/') {
-            return false;
-        }
-
-        self.0.starts_with(&parent.0)
-    }
-
-    /// Whether or not the current target is available at the end of the given chain of target
-    /// paths. For the chain to be valid, each target path in a group must be a child of of all
-    /// previous groups.
-    // TODO this is hideous and uses way too much clone/heap but I think recursively,
-    // so here we are
-    pub fn matches_chain(&self, parents: &[HashSet<TargetPath>]) -> bool {
-        if parents.is_empty() {
-            return false;
-        }
-        if parents.len() == 1 {
-            return parents[0].iter().any(|p| p == self || self.is_child(p));
-        }
-
-        let new = parents[1..]
-            .iter()
-            .map(|group| {
-                group
-                    .iter()
-                    .filter(|parent| {
-                        parents[0]
-                            .iter()
-                            .any(|p| parent.is_child(p) || parent == &p)
-                    })
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .collect::<Vec<_>>();
-        self.matches_chain(&new)
-    }
-
     /// Prefix the target path with a hash value to support TUF spec 5.5.2.
     pub fn with_hash_prefix(&self, hash: &HashValue) -> Result<TargetPath> {
         let mut components = self.components();
@@ -1698,6 +1651,82 @@ impl<'de> Deserialize<'de> for TargetPath {
 impl Borrow<str> for TargetPath {
     fn borrow(&self) -> &str {
         self.as_str()
+    }
+}
+
+/// A pattern for the paths of the targets a [Delegation] is trusted for, which is the
+/// specification's [`PATHPATTERN`].
+///
+/// Patterns use the shell-style wildcards `*`, which matches any sequence of characters, including
+/// the empty one, and `?`, which matches any one character. Wildcards match within a single path
+/// component, never a `/`. Every other character, including those in other glob syntax like
+/// `[a-z]`, only matches itself.
+///
+/// ```
+/// # use tuf::metadata::{PathPattern, TargetPath};
+/// let matches = |pattern: &str, path: &str| {
+///     PathPattern::new(pattern).unwrap().matches(&TargetPath::new(path).unwrap())
+/// };
+///
+/// assert!(matches("targets/*.tgz", "targets/foo.tgz"));
+/// assert!(!matches("targets/*.tgz", "targets/foo.txt"));
+/// assert!(matches("foo-version-?.tgz", "foo-version-2.tgz"));
+/// assert!(!matches("foo-version-?.tgz", "foo-version-alpha.tgz"));
+/// assert!(matches("*.tgz", "foo.tgz"));
+/// assert!(!matches("*.tgz", "targets/foo.tgz"));
+/// assert!(matches("foo.tgz", "foo.tgz"));
+///
+/// // A pattern isn't a prefix, so covering the targets in a directory takes a wildcard, and
+/// // covering those in its subdirectories takes another pattern.
+/// assert!(!matches("targets/", "targets/foo.tgz"));
+/// assert!(matches("targets/*", "targets/foo.tgz"));
+/// assert!(!matches("targets/*", "targets/a/foo.tgz"));
+/// assert!(matches("targets/*/*", "targets/a/foo.tgz"));
+/// ```
+///
+/// [`PATHPATTERN`]: https://theupdateframework.github.io/specification/v1.0.36/#pathpattern
+#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord, Serialize)]
+pub struct PathPattern(String);
+
+impl PathPattern {
+    /// Create a new `PathPattern` from a `String`.
+    ///
+    /// The same strings are illegal as in a [TargetPath], except for the `?` wildcard.
+    ///
+    /// ```
+    /// # use tuf::metadata::PathPattern;
+    /// assert!(PathPattern::new("foo/*").is_ok());
+    /// assert!(PathPattern::new("foo-?.tgz").is_ok());
+    /// assert!(PathPattern::new("/foo/*").is_err());
+    /// assert!(PathPattern::new("foo/../*").is_err());
+    /// ```
+    pub fn new<P: Into<String>>(pattern: P) -> Result<Self> {
+        let pattern = pattern.into();
+        safe_path_pattern(&pattern)?;
+        Ok(PathPattern(pattern))
+    }
+
+    /// Whether `target` matches this pattern.
+    pub fn matches(&self, target: &TargetPath) -> bool {
+        glob::matches(&self.0, target.as_str())
+    }
+
+    /// The string value of the pattern.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for PathPattern {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PathPattern {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> ::std::result::Result<Self, D::Error> {
+        let s: String = Deserialize::deserialize(de)?;
+        PathPattern::new(s).map_err(|e| DeserializeError::custom(format!("{:?}", e)))
     }
 }
 
@@ -2208,7 +2237,7 @@ pub struct Delegation {
     terminating: bool,
     threshold: MetadataThreshold,
     key_ids: HashSet<KeyId>,
-    paths: HashSet<TargetPath>,
+    paths: HashSet<PathPattern>,
 }
 
 impl Delegation {
@@ -2223,7 +2252,7 @@ impl Delegation {
         terminating: bool,
         threshold: MetadataThreshold,
         key_ids: HashSet<KeyId>,
-        paths: HashSet<TargetPath>,
+        paths: HashSet<PathPattern>,
     ) -> Result<Self> {
         if key_ids.is_empty() {
             return Err(Error::IllegalArgument("Cannot have empty key IDs".into()));
@@ -2268,9 +2297,18 @@ impl Delegation {
         self.threshold
     }
 
-    /// An immutable reference to the delegation's authorized paths.
-    pub fn paths(&self) -> &HashSet<TargetPath> {
+    /// An immutable reference to the patterns of the target paths this delegation is trusted for.
+    pub fn paths(&self) -> &HashSet<PathPattern> {
         &self.paths
+    }
+
+    /// Whether this delegation is trusted for `target`, which is when `target` matches any of its
+    /// [paths](Self::paths).
+    ///
+    /// A delegated role is only trusted for a target if every delegation in the chain from the
+    /// top-level targets role down to it is.
+    pub fn matches_target(&self, target: &TargetPath) -> bool {
+        self.paths.iter().any(|pattern| pattern.matches(target))
     }
 }
 
@@ -2298,7 +2336,7 @@ pub struct DelegationBuilder {
     terminating: bool,
     threshold: MetadataThreshold,
     key_ids: HashSet<KeyId>,
-    paths: HashSet<TargetPath>,
+    paths: HashSet<PathPattern>,
 }
 
 impl DelegationBuilder {
@@ -2331,9 +2369,9 @@ impl DelegationBuilder {
         self
     }
 
-    /// Delegate `path` to this delegation.
-    pub fn delegate_path(mut self, path: TargetPath) -> Self {
-        self.paths.insert(path);
+    /// Delegate the target paths matching `pattern` to this delegation.
+    pub fn delegate_path(mut self, pattern: PathPattern) -> Self {
+        self.paths.insert(pattern);
         self
     }
 
@@ -2386,7 +2424,7 @@ mod test {
             assert!(safe_path(path).is_err());
             assert!(TargetPath::new(path.to_string()).is_err());
             assert!(MetadataPath::new(path.to_string()).is_err());
-            assert!(TargetPath::new(path.to_string()).is_err());
+            assert!(PathPattern::new(path.to_string()).is_err());
         }
     }
 
@@ -2404,56 +2442,41 @@ mod test {
             assert!(safe_path(path).is_ok());
             assert!(TargetPath::new(path.to_string()).is_ok());
             assert!(MetadataPath::new(path.to_string()).is_ok());
+            assert!(PathPattern::new(path.to_string()).is_ok());
         }
     }
 
     #[test]
-    fn path_matches_chain() {
-        let test_cases: &[(bool, &str, &[&[&str]])] = &[
-            // simplest case
-            (true, "foo", &[&["foo"]]),
-            // direct delegation case
-            (true, "foo", &[&["foo"], &["foo"]]),
-            // is a dir
-            (false, "foo", &[&["foo/"]]),
-            // target not in last position
-            (false, "foo", &[&["foo"], &["bar"]]),
-            // target nested
-            (true, "foo/bar", &[&["foo/"], &["foo/bar"]]),
-            // target illegally nested
-            (false, "foo/bar", &[&["baz/"], &["foo/bar"]]),
-            // target illegally deeply nested
-            (
-                false,
-                "foo/bar/baz",
-                &[&["foo/"], &["foo/quux/"], &["foo/bar/baz"]],
-            ),
-            // empty
-            (false, "foo", &[&[]]),
-            // empty 2
-            (false, "foo", &[&[], &["foo"]]),
-            // empty 3
-            (false, "foo", &[&["foo"], &[]]),
-        ];
+    fn allow_question_mark_only_in_path_pattern() {
+        let paths = &["?", "some/?/path", "some-?.tgz"];
 
-        for case in test_cases {
-            let expected = case.0;
-            let target = TargetPath::new(case.1).unwrap();
-            let parents = case
-                .2
-                .iter()
-                .map(|group| {
-                    group
-                        .iter()
-                        .map(|p| TargetPath::new(p.to_string()).unwrap())
-                        .collect::<HashSet<_>>()
-                })
-                .collect::<Vec<_>>();
-            println!(
-                "CASE: expect: {} path: {:?} parents: {:?}",
-                expected, target, parents
-            );
-            assert_eq!(target.matches_chain(&parents), expected);
+        for path in paths.iter() {
+            assert!(PathPattern::new(path.to_string()).is_ok());
+            assert!(TargetPath::new(path.to_string()).is_err());
+            assert!(MetadataPath::new(path.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn delegation_matches_target() {
+        let key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
+        let delegation = Delegation::builder(MetadataPath::new("role").unwrap())
+            .key(key.public())
+            .delegate_path(PathPattern::new("foo/*").unwrap())
+            .delegate_path(PathPattern::new("bar-?.tgz").unwrap())
+            .build()
+            .unwrap();
+
+        for (path, expected) in [
+            ("foo/bar", true),
+            ("bar-1.tgz", true),
+            ("foo", false),
+            ("foo/bar/baz", false),
+            ("bar-10.tgz", false),
+            ("baz", false),
+        ] {
+            let target = TargetPath::new(path).unwrap();
+            assert_eq!(delegation.matches_target(&target), expected, "{path}");
         }
     }
 
@@ -2463,6 +2486,16 @@ mod test {
         let t = serde_json::from_str::<TargetPath>(&format!("\"{}\"", s)).unwrap();
         assert_eq!(t.to_string().as_str(), s);
         assert_eq!(serde_json::to_value(t).unwrap(), json!("foo/bar"));
+    }
+
+    #[test]
+    fn serde_path_pattern() {
+        let s = "foo/*-?.tgz";
+        let p = serde_json::from_str::<PathPattern>(&format!("\"{}\"", s)).unwrap();
+        assert_eq!(p.to_string().as_str(), s);
+        assert_eq!(serde_json::to_value(p).unwrap(), json!("foo/*-?.tgz"));
+
+        assert!(serde_json::from_str::<PathPattern>("\"/foo/*\"").is_err());
     }
 
     #[test]
@@ -3543,7 +3576,7 @@ mod test {
                     false,
                     MetadataThreshold::ONE,
                     hashset!(key.public().key_id().clone()),
-                    hashset!(TargetPath::new("baz/quux").unwrap()),
+                    hashset!(PathPattern::new("baz/quux").unwrap()),
                 )
                 .unwrap(),
             ],
@@ -3738,7 +3771,7 @@ mod test {
                     false,
                     MetadataThreshold::ONE,
                     hashset!(key.key_id().clone()),
-                    hashset!(TargetPath::new("bar").unwrap()),
+                    hashset!(PathPattern::new("bar").unwrap()),
                 )
                 .unwrap(),
             ],
@@ -3758,7 +3791,7 @@ mod test {
             false,
             MetadataThreshold::ONE,
             hashset!(key.key_id().clone()),
-            hashset!(TargetPath::new("bar").unwrap()),
+            hashset!(PathPattern::new("bar").unwrap()),
         )
         .unwrap();
 
@@ -4135,13 +4168,13 @@ mod test {
                 true,
                 MetadataThreshold::ONE,
                 hashset!(key.key_id().clone()),
-                hashset!(TargetPath::new(path.to_owned()).unwrap()),
+                hashset!(PathPattern::new(path.to_owned()).unwrap()),
             )
             .unwrap()
         };
         let delegations = Delegations::new(
             hashmap! { key.key_id().clone() => key.clone() },
-            vec![role("b", "a/b/"), role("a", "a/")],
+            vec![role("b", "a/b"), role("a", "a/*")],
         )
         .unwrap();
 

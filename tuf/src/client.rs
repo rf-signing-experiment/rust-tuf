@@ -41,8 +41,8 @@
 use chrono::{DateTime, offset::Utc};
 use futures_io::AsyncRead;
 use log::{error, warn};
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use crate::crypto::{self, HashAlgorithm, HashValue, PublicKey};
 use crate::database::Database;
@@ -928,11 +928,21 @@ where
         target: &TargetPath,
         start_time: &DateTime<Utc>,
     ) -> Result<TargetDescription> {
+        // These clones are dumb, but we need values rather than references into `self.tuf`, since
+        // the search updates it.
         let snapshot = self
             .tuf
             .trusted_snapshot()
             .ok_or_else(|| Error::MetadataNotFound {
                 path: MetadataPath::snapshot(),
+                version: None,
+            })?
+            .clone();
+        let targets = self
+            .tuf
+            .trusted_targets()
+            .ok_or_else(|| Error::MetadataNotFound {
+                path: MetadataPath::targets(),
                 version: None,
             })?
             .clone();
@@ -945,185 +955,165 @@ where
         //     any metadata requested in steps 5.6.7.1 - 5.6.7.2 cannot be downloaded nor
         //     validated, end the search and report that the target cannot be found.
 
-        let (_, target_description) = self
-            .lookup_target_description(start_time, false, 0, target, &snapshot, None)
-            .await;
-
-        target_description
+        let targets_role = MetadataPath::targets();
+        let mut visited = HashSet::from([targets_role.clone()]);
+        match self
+            .lookup_target_description(
+                start_time,
+                target,
+                &snapshot,
+                &targets_role,
+                &targets,
+                0,
+                &mut visited,
+            )
+            .await
+        {
+            ControlFlow::Break(result) => result,
+            ControlFlow::Continue(()) => Err(Error::TargetNotFound(target.clone())),
+        }
     }
 
+    /// Search `targets`, the metadata of `role`, and then the roles it delegates `target` to, in
+    /// order. Returns `Break` once the search is over, with its result, or `Continue` if the
+    /// search should go on past the delegation that led to `role`.
     async fn lookup_target_description(
         &mut self,
         start_time: &DateTime<Utc>,
-        default_terminate: bool,
-        current_depth: u32,
         target: &TargetPath,
         snapshot: &SnapshotMetadata,
-        targets: Option<(&Verified<TargetsMetadata>, MetadataPath)>,
-    ) -> (bool, Result<TargetDescription>) {
-        if current_depth > self.config.max_delegation_depth {
-            warn!(
-                "Walking the delegation graph would have exceeded the configured max depth: {}",
-                self.config.max_delegation_depth
-            );
-            return (
-                default_terminate,
-                Err(Error::TargetNotFound(target.clone())),
-            );
-        }
-
-        // these clones are dumb, but we need immutable values and not references for update
-        // tuf in the loop below
-        let (targets, targets_role) = match targets {
-            Some((t, role)) => (t.clone(), role),
-            None => match self.tuf.trusted_targets() {
-                Some(t) => (t.clone(), MetadataPath::targets()),
-                None => {
-                    return (
-                        default_terminate,
-                        Err(Error::MetadataNotFound {
-                            path: MetadataPath::targets(),
-                            version: None,
-                        }),
-                    );
-                }
-            },
-        };
-
-        if let Some(t) = targets.targets().get(target) {
-            return (default_terminate, Ok(t.clone()));
+        role: &MetadataPath,
+        targets: &TargetsMetadata,
+        depth: u32,
+        visited: &mut HashSet<MetadataPath>,
+    ) -> ControlFlow<Result<TargetDescription>> {
+        if let Some(description) = targets.targets().get(target) {
+            return ControlFlow::Break(Ok(description.clone()));
         }
 
         for delegation in targets.delegations().roles() {
-            if !delegation
-                .paths()
-                .iter()
-                .any(|p| target == p || target.is_child(p))
-            {
+            // Only follow delegations that are trusted for the target. Since this is checked at
+            // every step, so is every delegation in the chain down to the target.
+            if !delegation.matches_target(target) {
                 continue;
             }
 
-            let role_meta = match snapshot.meta().get(delegation.name()) {
-                Some(m) => m,
-                None if delegation.terminating() => {
-                    return (true, Err(Error::TargetNotFound(target.clone())));
+            // Skip roles that were visited before, so that cycles end.
+            if visited.insert(delegation.name().clone()) {
+                // Going too deep ends the search, like failing to fetch and verify a role's
+                // metadata does, so that later delegations can't stand in for the roles that
+                // weren't searched.
+                if depth >= self.config.max_delegation_depth {
+                    warn!(
+                        "Walking the delegation graph would have exceeded the configured max depth: {}",
+                        self.config.max_delegation_depth
+                    );
+                    return ControlFlow::Break(Err(Error::TargetNotFound(target.clone())));
                 }
-                None => {
-                    continue;
-                }
-            };
 
-            /////////////////////////////////////////
-            // TUF-1.0.9 §5.4:
-            //
-            //     Download the top-level targets metadata file, up to either the number of bytes
-            //     specified in the snapshot metadata file, or some Z number of bytes. The value
-            //     for Z is set by the authors of the application using TUF. For example, Z may be
-            //     tens of kilobytes. If consistent snapshots are not used (see Section 7), then
-            //     the filename used to download the targets metadata file is of the fixed form
-            //     FILENAME.EXT (e.g., targets.json). Otherwise, the filename is of the form
-            //     VERSION_NUMBER.FILENAME.EXT (e.g., 42.targets.json), where VERSION_NUMBER is the
-            //     version number of the targets metadata file listed in the snapshot metadata
-            //     file.
+                let delegated = match self
+                    .update_delegated_targets(start_time, snapshot, role, delegation.name())
+                    .await
+                {
+                    Ok(delegated) => delegated,
+                    Err(err) => return ControlFlow::Break(Err(err)),
+                };
 
-            let version = if self.tuf.trusted_root().consistent_snapshot() {
-                Some(role_meta.version())
-            } else {
-                None
-            };
+                Box::pin(self.lookup_target_description(
+                    start_time,
+                    target,
+                    snapshot,
+                    delegation.name(),
+                    &delegated,
+                    depth + 1,
+                    visited,
+                ))
+                .await?;
+            }
 
-            let role_length = role_meta.length().or(self.config.max_targets_length);
-
-            // https://theupdateframework.github.io/specification/v1.0.26/#update-targets
-            //
-            //     [...] The hashes of the new targets metadata file MUST match the hashes, if
-            //      any, listed in the trusted snapshot metadata.
-            let role_hashes = crypto::retain_supported_hashes(role_meta.hashes());
-
-            let raw_signed_meta = match self
-                .remote
-                .fetch_metadata(delegation.name(), version, role_length, role_hashes)
-                .await
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to fetch metadata {:?}: {:?}", delegation.name(), e);
-                    if delegation.terminating() {
-                        return (true, Err(e));
-                    } else {
-                        continue;
-                    }
-                }
-            };
-
-            match self.tuf.update_delegated_targets(
-                start_time,
-                &targets_role,
-                delegation.name(),
-                &raw_signed_meta,
-            ) {
-                Ok(_) => {
-                    /////////////////////////////////////////
-                    // TUF-1.0.9 §5.4.4:
-                    //
-                    //     Persist targets metadata. The client MUST write the file to non-volatile
-                    //     storage as FILENAME.EXT (e.g. targets.json).
-
-                    match self
-                        .local
-                        .store_metadata(delegation.name(), None, &raw_signed_meta)
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            warn!(
-                                "Error storing metadata {:?} locally: {:?}",
-                                delegation.name(),
-                                e
-                            )
-                        }
-                    }
-
-                    let meta = match self.tuf.trusted_delegations().get(delegation.name()) {
-                        Some(m) => m.clone(),
-                        None => {
-                            let err = Error::MetadataNotFound {
-                                path: delegation.name().clone(),
-                                version: None,
-                            };
-                            if delegation.terminating() {
-                                return (true, Err(err));
-                            } else {
-                                continue;
-                            }
-                        }
-                    };
-                    let f: Pin<Box<dyn Future<Output = _>>> =
-                        Box::pin(self.lookup_target_description(
-                            start_time,
-                            delegation.terminating(),
-                            current_depth + 1,
-                            target,
-                            snapshot,
-                            Some((&meta, delegation.name().clone())),
-                        ));
-                    let (term, res): (_, Result<_>) = f.await;
-
-                    // Stop at the first delegation that finds the target, or that ends the search
-                    // because it's terminating.
-                    if term || res.is_ok() {
-                        return (term, res);
-                    }
-                }
-                Err(_) if !delegation.terminating() => continue,
-                Err(e) => return (true, Err(e)),
-            };
+            // A terminating delegation ends the search, even if it didn't lead to the target.
+            if delegation.terminating() {
+                return ControlFlow::Break(Err(Error::TargetNotFound(target.clone())));
+            }
         }
 
-        (
-            default_terminate,
-            Err(Error::TargetNotFound(target.clone())),
-        )
+        ControlFlow::Continue(())
+    }
+
+    /// Fetch, verify, and store the metadata of `role`, which `parent_role` delegates to.
+    async fn update_delegated_targets(
+        &mut self,
+        start_time: &DateTime<Utc>,
+        snapshot: &SnapshotMetadata,
+        parent_role: &MetadataPath,
+        role: &MetadataPath,
+    ) -> Result<Verified<TargetsMetadata>> {
+        let role_meta =
+            snapshot
+                .meta()
+                .get(role)
+                .ok_or_else(|| Error::MissingMetadataDescription {
+                    parent_role: MetadataPath::snapshot(),
+                    child_role: role.clone(),
+                })?;
+
+        /////////////////////////////////////////
+        // TUF-1.0.9 §5.4:
+        //
+        //     Download the top-level targets metadata file, up to either the number of bytes
+        //     specified in the snapshot metadata file, or some Z number of bytes. The value
+        //     for Z is set by the authors of the application using TUF. For example, Z may be
+        //     tens of kilobytes. If consistent snapshots are not used (see Section 7), then
+        //     the filename used to download the targets metadata file is of the fixed form
+        //     FILENAME.EXT (e.g., targets.json). Otherwise, the filename is of the form
+        //     VERSION_NUMBER.FILENAME.EXT (e.g., 42.targets.json), where VERSION_NUMBER is the
+        //     version number of the targets metadata file listed in the snapshot metadata
+        //     file.
+
+        let version = if self.tuf.trusted_root().consistent_snapshot() {
+            Some(role_meta.version())
+        } else {
+            None
+        };
+
+        let role_length = role_meta.length().or(self.config.max_targets_length);
+
+        // https://theupdateframework.github.io/specification/v1.0.26/#update-targets
+        //
+        //     [...] The hashes of the new targets metadata file MUST match the hashes, if
+        //      any, listed in the trusted snapshot metadata.
+        let role_hashes = crypto::retain_supported_hashes(role_meta.hashes());
+
+        let raw_signed_meta = self
+            .remote
+            .fetch_metadata(role, version, role_length, role_hashes)
+            .await?;
+
+        self.tuf
+            .update_delegated_targets(start_time, parent_role, role, &raw_signed_meta)?;
+
+        /////////////////////////////////////////
+        // TUF-1.0.9 §5.4.4:
+        //
+        //     Persist targets metadata. The client MUST write the file to non-volatile
+        //     storage as FILENAME.EXT (e.g. targets.json).
+
+        if let Err(e) = self
+            .local
+            .store_metadata(role, None, &raw_signed_meta)
+            .await
+        {
+            warn!("Error storing metadata {:?} locally: {:?}", role, e);
+        }
+
+        self.tuf
+            .trusted_delegations()
+            .get(role)
+            .cloned()
+            .ok_or_else(|| Error::MetadataNotFound {
+                path: role.clone(),
+                version: None,
+            })
     }
 }
 
@@ -1236,7 +1226,8 @@ impl Config {
         &self.max_targets_length
     }
 
-    /// The maximum number of steps used when walking the delegation graph.
+    /// The maximum depth of the delegations searched for a target. A search that would go deeper
+    /// ends without finding the target.
     pub fn max_delegation_depth(&self) -> u32 {
         self.max_delegation_depth
     }
@@ -1290,7 +1281,8 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the maximum number of steps used when walking the delegation graph.
+    /// Set the maximum depth of the delegations searched for a target. A search that would go
+    /// deeper ends without finding the target.
     pub fn max_delegation_depth(mut self, max: u32) -> Self {
         self.cfg.max_delegation_depth = max;
         self
@@ -1302,7 +1294,7 @@ mod test {
     use super::*;
     use crate::crypto::{Ed25519PrivateKey, HashAlgorithm, PrivateKey};
     use crate::metadata::{
-        Delegation, MetadataDescription, MetadataPath, MetadataVersion, RootMetadataBuilder,
+        MetadataDescription, MetadataPath, MetadataVersion, RootMetadataBuilder,
         SnapshotMetadataBuilder, TargetsMetadataBuilder, TimestampMetadataBuilder,
     };
     use crate::pouf::Pouf1;
@@ -1316,7 +1308,7 @@ mod test {
     use maplit::hashmap;
     use pretty_assertions::assert_eq;
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::iter::once;
     use std::num::NonZeroU32;
     use std::sync::LazyLock;
@@ -2125,133 +2117,6 @@ mod test {
             .unwrap();
 
         assert_eq!(description, expected_description);
-    }
-
-    #[test]
-    fn test_fetch_target_description_delegated() {
-        block_on(async {
-            for path in ["a/foo", "b/foo"] {
-                let expected =
-                    TargetDescription::from_slice(path.as_bytes(), &[HashAlgorithm::Sha256])
-                        .unwrap();
-                assert_eq!(
-                    fetch_delegated_target_description(path).await.unwrap(),
-                    expected
-                );
-            }
-        })
-    }
-
-    #[test]
-    fn test_fetch_target_description_stops_at_terminating_delegation() {
-        block_on(async {
-            assert_matches!(
-                fetch_delegated_target_description("c/foo").await,
-                Err(Error::TargetNotFound(_))
-            );
-        })
-    }
-
-    /// Look up `path` in a repository whose top-level targets lists nothing itself, and instead
-    /// delegates to these terminating roles in order:
-    ///
-    /// * `a`, trusted for `a/`, which lists `a/foo`.
-    /// * `b`, trusted for `b/`, which lists `b/foo`.
-    /// * `c`, trusted for `c/`, which lists nothing.
-    /// * `d`, trusted for `c/`, which lists `c/foo`.
-    ///
-    /// Each target's contents are its own path.
-    async fn fetch_delegated_target_description(path: &str) -> Result<TargetDescription> {
-        let delegation_key = &KEYS[1];
-        let roles = [
-            ("a", "a/", Some("a/foo")),
-            ("b", "b/", Some("b/foo")),
-            ("c", "c/", None),
-            ("d", "c/", Some("c/foo")),
-        ];
-
-        let mut delegations = Vec::new();
-        let mut delegated_targets = Vec::new();
-        for (name, prefix, target) in roles {
-            let name = MetadataPath::new(name).unwrap();
-            delegations.push(
-                Delegation::new(
-                    name.clone(),
-                    true,
-                    MetadataThreshold::ONE,
-                    HashSet::from([delegation_key.public().key_id().clone()]),
-                    HashSet::from([TargetPath::new(prefix).unwrap()]),
-                )
-                .unwrap(),
-            );
-
-            let mut builder = TargetsMetadataBuilder::new();
-            if let Some(target) = target {
-                builder = builder
-                    .insert_target_from_slice(
-                        TargetPath::new(target).unwrap(),
-                        target.as_bytes(),
-                        &[HashAlgorithm::Sha256],
-                    )
-                    .unwrap();
-            }
-            delegated_targets.push((name, builder.signed::<Pouf1>(delegation_key).unwrap()));
-        }
-
-        let mut remote = EphemeralRepository::<Pouf1>::new();
-        let mut builder = RepoBuilder::create(&mut remote)
-            .trusted_root_keys(&[&KEYS[0]])
-            .trusted_targets_keys(&[&KEYS[0]])
-            .trusted_snapshot_keys(&[&KEYS[0]])
-            .trusted_timestamp_keys(&[&KEYS[0]])
-            .stage_root()
-            .unwrap()
-            .add_delegation_key(delegation_key.public().clone());
-        for delegation in delegations {
-            builder = builder.add_delegation_role(delegation);
-        }
-        let metadata = builder
-            .stage_targets()
-            .unwrap()
-            .stage_snapshot_with_builder(|mut builder| {
-                for (name, targets) in &delegated_targets {
-                    builder = builder
-                        .insert_metadata_with_path(
-                            name.as_str().to_owned(),
-                            targets,
-                            &[HashAlgorithm::Sha256],
-                        )
-                        .unwrap();
-                }
-                builder
-            })
-            .unwrap()
-            .commit()
-            .await
-            .unwrap();
-
-        for (name, targets) in &delegated_targets {
-            let raw = targets.to_raw().unwrap();
-            remote
-                .store_metadata(name, Some(MetadataVersion::ONE), &mut raw.as_bytes())
-                .await
-                .unwrap();
-        }
-
-        let mut client = Client::with_trusted_root(
-            Config::default(),
-            metadata.root().unwrap(),
-            EphemeralRepository::new(),
-            remote,
-        )
-        .await
-        .unwrap();
-
-        assert_matches!(client.update().await, Ok(true));
-
-        client
-            .fetch_target_description(&TargetPath::new(path).unwrap())
-            .await
     }
 
     #[test]

@@ -417,7 +417,7 @@ pub struct Delegation {
     threshold: MetadataThreshold,
     #[serde(rename = "keyids")]
     key_ids: Vec<crypto::KeyId>,
-    paths: Vec<metadata::TargetPath>,
+    paths: Vec<metadata::PathPattern>,
 }
 
 impl From<&metadata::Delegation> for Delegation {
@@ -426,7 +426,7 @@ impl From<&metadata::Delegation> for Delegation {
             .paths()
             .iter()
             .cloned()
-            .collect::<Vec<metadata::TargetPath>>();
+            .collect::<Vec<metadata::PathPattern>>();
         paths.sort();
 
         let mut key_ids = delegation

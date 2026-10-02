@@ -4,12 +4,13 @@ use chrono::{DateTime, offset::Utc};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
 
 use crate::Result;
 use crate::crypto::PublicKey;
 use crate::error::Error;
 use crate::metadata::{
-    Delegations, Metadata, MetadataPath, MetadataThreshold, MetadataVersion, RawSignedMetadata,
+    Metadata, MetadataPath, MetadataThreshold, MetadataVersion, RawSignedMetadata,
     RawSignedMetadataSet, RootMetadata, SnapshotMetadata, TargetDescription, TargetPath,
     TargetsMetadata, TimestampMetadata,
 };
@@ -909,89 +910,53 @@ impl<D: Pouf> Database<D> {
         let _ = self.trusted_snapshot_unexpired(start_time)?;
         let targets = self.trusted_targets_unexpired(start_time)?;
 
-        if let Some(d) = targets.targets().get(target_path) {
-            return Ok(d.clone());
-        }
-
+        /// Search `targets`, and then the roles it delegates `target_path` to, in order. Returns
+        /// `Break` once the search is over, with the target's description if it was found, or
+        /// `Continue` if the search should go on past the delegation that led to `targets`.
         fn lookup<'a, D: Pouf>(
             start_time: &DateTime<Utc>,
             tuf: &'a Database<D>,
-            default_terminate: bool,
-            current_depth: u32,
             target_path: &TargetPath,
-            delegations: &'a Delegations,
-            parents: &[HashSet<TargetPath>],
+            targets: &'a TargetsMetadata,
             visited: &mut HashSet<&'a MetadataPath>,
-        ) -> (bool, Option<TargetDescription>) {
-            for delegation in delegations.roles() {
-                if visited.contains(delegation.name()) {
-                    return (delegation.terminating(), None);
-                }
-                let _ = visited.insert(delegation.name());
+        ) -> ControlFlow<Option<TargetDescription>> {
+            if let Some(description) = targets.targets().get(target_path) {
+                return ControlFlow::Break(Some(description.clone()));
+            }
 
-                let mut new_parents = parents.to_owned();
-                new_parents.push(delegation.paths().clone());
-
-                if current_depth > 0 && !target_path.matches_chain(parents) {
-                    return (delegation.terminating(), None);
+            for delegation in targets.delegations().roles() {
+                // Only follow delegations that are trusted for the target. Since this is checked
+                // at every step, so is every delegation in the chain down to the target.
+                if !delegation.matches_target(target_path) {
+                    continue;
                 }
 
-                let trusted_delegation = match tuf.trusted_delegations.get(delegation.name()) {
-                    Some(trusted_delegation) => trusted_delegation,
-                    None => return (delegation.terminating(), None),
-                };
-
-                if trusted_delegation.expires() <= start_time {
-                    return (delegation.terminating(), None);
-                }
-
-                if let Some(target) = trusted_delegation.targets().get(target_path) {
-                    return (delegation.terminating(), Some(target.clone()));
-                }
-
-                let trusted_child_delegations = trusted_delegation.delegations();
-
-                // We only need to check the child delegations if it delegates to any child roles.
-                if !trusted_child_delegations.roles().is_empty() {
-                    let mut new_parents = parents.to_vec();
-                    new_parents.push(delegation.paths().clone());
-                    let (term, res) = lookup(
-                        start_time,
-                        tuf,
-                        delegation.terminating(),
-                        current_depth + 1,
-                        target_path,
-                        trusted_child_delegations,
-                        &new_parents,
-                        visited,
-                    );
-                    if term {
-                        return (true, res);
-                    } else if res.is_some() {
-                        return (term, res);
+                // Skip roles that were visited before, so that cycles end.
+                if visited.insert(delegation.name()) {
+                    // If a role's metadata isn't trusted, because it wasn't loaded or has expired,
+                    // the search ends, so that later delegations can't stand in for it.
+                    match tuf.trusted_delegations.get(delegation.name()) {
+                        Some(delegated) if delegated.expires() > start_time => {
+                            lookup(start_time, tuf, target_path, delegated, visited)?
+                        }
+                        _ => return ControlFlow::Break(None),
                     }
                 }
+
+                // A terminating delegation ends the search, even if it didn't lead to the target.
+                if delegation.terminating() {
+                    return ControlFlow::Break(None);
+                }
             }
-            (default_terminate, None)
+
+            ControlFlow::Continue(())
         }
 
-        let delegations = targets.delegations();
-        if delegations.roles().is_empty() {
-            Err(Error::TargetNotFound(target_path.clone()))
-        } else {
-            let mut visited = HashSet::new();
-            lookup(
-                start_time,
-                self,
-                false,
-                0,
-                target_path,
-                delegations,
-                &[],
-                &mut visited,
-            )
-            .1
-            .ok_or_else(|| Error::TargetNotFound(target_path.clone()))
+        let targets_role = MetadataPath::targets();
+        let mut visited = HashSet::from([&targets_role]);
+        match lookup(start_time, self, target_path, targets, &mut visited) {
+            ControlFlow::Break(Some(description)) => Ok(description),
+            _ => Err(Error::TargetNotFound(target_path.clone())),
         }
     }
 

@@ -1566,7 +1566,7 @@ mod tests {
         crate::{
             client::{Client, Config},
             crypto::Ed25519PrivateKey,
-            metadata::{MetadataThreshold, SignedMetadata},
+            metadata::{MetadataThreshold, PathPattern, SignedMetadata},
             pouf::Pouf1,
             repository::{EphemeralRepository, RepositoryProvider},
         },
@@ -2607,7 +2607,7 @@ mod tests {
 
             let delegation1 = Delegation::builder(delegation_path.clone())
                 .key(delegation_key.public())
-                .delegate_path(TargetPath::new("delegations/").unwrap())
+                .delegate_path(PathPattern::new("delegations/*").unwrap())
                 .build()
                 .unwrap();
 
@@ -2665,7 +2665,7 @@ mod tests {
 
             let delegation2 = Delegation::builder(delegation_path.clone())
                 .key(delegation_key.public())
-                .delegate_path(TargetPath::new("delegations/").unwrap())
+                .delegate_path(PathPattern::new("delegations/*").unwrap())
                 .build()
                 .unwrap();
 
