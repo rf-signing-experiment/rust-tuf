@@ -49,7 +49,7 @@ use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::metadata::{
     Metadata, MetadataPath, MetadataVersion, RawSignedMetadata, RootMetadata, SnapshotMetadata,
-    TargetDescription, TargetPath, TargetsMetadata,
+    TargetDescription, TargetPath, TargetsMetadata, TimestampMetadata,
 };
 use crate::pouf::Pouf;
 use crate::repository::{Repository, RepositoryProvider, RepositoryStorage};
@@ -362,11 +362,14 @@ where
         let start_time = Utc::now();
 
         let res = async {
-            let _r =
-                Self::update_root_with_repos(&start_time, &config, &mut tuf, None, &local).await?;
-            let _ts =
-                Self::update_timestamp_with_repos(&start_time, &config, &mut tuf, None, &local)
-                    .await?;
+            let _ = Self::update_root_and_timestamp_with_repos(
+                &start_time,
+                &config,
+                &mut tuf,
+                None,
+                &local,
+            )
+            .await?;
             let _sn = Self::update_snapshot_with_repos(
                 &start_time,
                 &config,
@@ -419,8 +422,14 @@ where
     ///
     /// **WARNING**: Using an older time opens up users to a freeze attack.
     pub async fn update_with_start_time(&mut self, start_time: &DateTime<Utc>) -> Result<bool> {
-        let r = self.update_root(start_time).await?;
-        let ts = self.update_timestamp(start_time).await?;
+        let (r, ts) = Self::update_root_and_timestamp_with_repos(
+            start_time,
+            &self.config,
+            &mut self.tuf,
+            Some(&mut self.local),
+            &self.remote,
+        )
+        .await?;
         let sn = self.update_snapshot(start_time).await?;
         let ta = self.update_targets(start_time).await?;
 
@@ -487,80 +496,34 @@ where
         .await
     }
 
+    /// Update the root metadata: by probing for each successive version as the specification
+    /// describes, or with the `timestamp-root-version` feature, using the remote timestamp as the root
+    /// version hint.
+    ///
+    /// Returns `true` if an update occurred and `false` otherwise.
     async fn update_root_with_repos<Remote>(
         start_time: &DateTime<Utc>,
         config: &Config,
         tuf: &mut Database<D>,
-        mut local: Option<&mut Repository<L, D>>,
+        local: Option<&mut Repository<L, D>>,
         remote: &Repository<Remote, D>,
     ) -> Result<bool>
     where
         Remote: RepositoryProvider<D>,
     {
-        let root_path = MetadataPath::root();
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let updated = Self::update_root_sequentially(config, tuf, local, remote).await?;
+        #[cfg(feature = "timestamp-root-version")]
+        let updated = {
+            let timestamp = Self::fetch_timestamp(config, remote).await?;
+            Self::update_root_with_hint(config, tuf, local, remote, timestamp.as_ref()).await?
+        };
+        Self::check_root_expiration(start_time, tuf)?;
 
-        let mut updated = false;
+        Ok(updated)
+    }
 
-        loop {
-            /////////////////////////////////////////
-            // TUF-1.0.9 §5.1.2:
-            //
-            //     Try downloading version N+1 of the root metadata file, up to some W number of
-            //     bytes (because the size is unknown). The value for W is set by the authors of
-            //     the application using TUF. For example, W may be tens of kilobytes. The filename
-            //     used to download the root metadata file is of the fixed form
-            //     VERSION_NUMBER.FILENAME.EXT (e.g., 42.root.json). If this file is not available,
-            //     or we have downloaded more than Y number of root metadata files (because the
-            //     exact number is as yet unknown), then go to step 5.1.9. The value for Y is set
-            //     by the authors of the application using TUF. For example, Y may be 2^10.
-
-            // FIXME(#306) We do not have an upper bound on the number of root metadata we'll
-            // fetch. This means that an attacker that's stolen the root keys could cause a client
-            // to fall into an infinite loop (but if an attacker has stolen the root keys, the
-            // client probably has worse problems to worry about).
-
-            let next_version = MetadataVersion::Number(tuf.trusted_root().version() + 1);
-            let res = remote
-                .fetch_metadata(&root_path, next_version, config.max_root_length, vec![])
-                .await;
-
-            let raw_signed_root = match res {
-                Ok(raw_signed_root) => raw_signed_root,
-                Err(Error::MetadataNotFound { .. }) => {
-                    break;
-                }
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-
-            updated = true;
-
-            tuf.update_root(&raw_signed_root)?;
-
-            /////////////////////////////////////////
-            // TUF-1.0.9 §5.1.7:
-            //
-            //     Persist root metadata. The client MUST write the file to non-volatile storage as
-            //     FILENAME.EXT (e.g. root.json).
-
-            if let Some(ref mut local) = local {
-                local
-                    .store_metadata(&root_path, MetadataVersion::None, &raw_signed_root)
-                    .await?;
-
-                // NOTE(#301): See the comment in `Client::with_trusted_root_keys`.
-                local
-                    .store_metadata(&root_path, next_version, &raw_signed_root)
-                    .await?;
-            }
-
-            /////////////////////////////////////////
-            // TUF-1.0.9 §5.1.8:
-            //
-            //     Repeat steps 5.1.1 to 5.1.8.
-        }
-
+    fn check_root_expiration(start_time: &DateTime<Utc>, tuf: &Database<D>) -> Result<()> {
         /////////////////////////////////////////
         // TUF-1.0.9 §5.1.9:
         //
@@ -587,52 +550,111 @@ where
         //     Set whether consistent snapshots are used as per the trusted root metadata file (see
         //     Section 4.3).
 
-        Ok(updated)
+        Ok(())
     }
 
+    /// Update the root metadata by probing for each successive version until one is missing, as
+    /// the specification describes.
+    ///
     /// Returns `true` if an update occurred and `false` otherwise.
-    async fn update_timestamp(&mut self, start_time: &DateTime<Utc>) -> Result<bool> {
-        Self::update_timestamp_with_repos(
-            start_time,
-            &self.config,
-            &mut self.tuf,
-            Some(&mut self.local),
-            &self.remote,
-        )
-        .await
-    }
-
-    async fn update_timestamp_with_repos<Remote>(
-        start_time: &DateTime<Utc>,
+    async fn update_root_sequentially<Remote>(
         config: &Config,
         tuf: &mut Database<D>,
-        local: Option<&mut Repository<L, D>>,
+        mut local: Option<&mut Repository<L, D>>,
         remote: &Repository<Remote, D>,
     ) -> Result<bool>
     where
         Remote: RepositoryProvider<D>,
     {
-        let timestamp_path = MetadataPath::timestamp();
+        let mut updated = false;
 
-        /////////////////////////////////////////
-        // TUF-1.0.9 §5.2:
-        //
-        //     Download the timestamp metadata file, up to X number of bytes (because the size is
-        //     unknown). The value for X is set by the authors of the application using TUF. For
-        //     example, X may be tens of kilobytes. The filename used to download the timestamp
-        //     metadata file is of the fixed form FILENAME.EXT (e.g., timestamp.json).
+        loop {
+            /////////////////////////////////////////
+            // TUF-1.0.9 §5.1.2:
+            //
+            //     Try downloading version N+1 of the root metadata file, up to some W number of
+            //     bytes (because the size is unknown). The value for W is set by the authors of
+            //     the application using TUF. For example, W may be tens of kilobytes. The filename
+            //     used to download the root metadata file is of the fixed form
+            //     VERSION_NUMBER.FILENAME.EXT (e.g., 42.root.json). If this file is not available,
+            //     or we have downloaded more than Y number of root metadata files (because the
+            //     exact number is as yet unknown), then go to step 5.1.9. The value for Y is set
+            //     by the authors of the application using TUF. For example, Y may be 2^10.
 
-        let raw_signed_timestamp = remote
-            .fetch_metadata(
-                &timestamp_path,
-                MetadataVersion::None,
-                config.max_timestamp_length,
-                vec![],
-            )
+            // FIXME(#306) We do not have an upper bound on the number of root metadata we'll
+            // fetch. This means that an attacker that's stolen the root keys could cause a client
+            // to fall into an infinite loop (but if an attacker has stolen the root keys, the
+            // client probably has worse problems to worry about).
+
+            let next_version = MetadataVersion::Number(tuf.trusted_root().version() + 1);
+            match Self::install_root(config, tuf, local.as_deref_mut(), remote, next_version).await
+            {
+                Ok(()) => updated = true,
+                Err(Error::MetadataNotFound { .. }) => break,
+                Err(err) => return Err(err),
+            }
+
+            /////////////////////////////////////////
+            // TUF-1.0.9 §5.1.8:
+            //
+            //     Repeat steps 5.1.1 to 5.1.8.
+        }
+
+        Ok(updated)
+    }
+
+    /// Download root metadata `version`, verify that it extends the trusted root chain, and
+    /// persist it.
+    ///
+    /// Fails with [Error::MetadataNotFound] if the remote does not have that version.
+    async fn install_root<Remote>(
+        config: &Config,
+        tuf: &mut Database<D>,
+        local: Option<&mut Repository<L, D>>,
+        remote: &Repository<Remote, D>,
+        version: MetadataVersion,
+    ) -> Result<()>
+    where
+        Remote: RepositoryProvider<D>,
+    {
+        let root_path = MetadataPath::root();
+        let raw_signed_root = remote
+            .fetch_metadata(&root_path, version, config.max_root_length, vec![])
             .await?;
 
+        tuf.update_root(&raw_signed_root)?;
+
+        /////////////////////////////////////////
+        // TUF-1.0.9 §5.1.7:
+        //
+        //     Persist root metadata. The client MUST write the file to non-volatile storage as
+        //     FILENAME.EXT (e.g. root.json).
+
+        if let Some(local) = local {
+            local
+                .store_metadata(&root_path, MetadataVersion::None, &raw_signed_root)
+                .await?;
+
+            // NOTE(#301): See the comment in `Client::with_trusted_root_keys`.
+            local
+                .store_metadata(&root_path, version, &raw_signed_root)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Verify an already downloaded timestamp and, if it is new, persist it.
+    ///
+    /// Returns `true` if an update occurred and `false` otherwise.
+    async fn update_timestamp_from_raw(
+        start_time: &DateTime<Utc>,
+        tuf: &mut Database<D>,
+        local: Option<&mut Repository<L, D>>,
+        raw_signed_timestamp: &RawSignedMetadata<D, TimestampMetadata>,
+    ) -> Result<bool> {
         if tuf
-            .update_timestamp(start_time, &raw_signed_timestamp)?
+            .update_timestamp(start_time, raw_signed_timestamp)?
             .is_some()
         {
             /////////////////////////////////////////
@@ -644,9 +666,9 @@ where
             if let Some(local) = local {
                 local
                     .store_metadata(
-                        &timestamp_path,
+                        &MetadataPath::timestamp(),
                         MetadataVersion::None,
-                        &raw_signed_timestamp,
+                        raw_signed_timestamp,
                     )
                     .await?;
             }
@@ -1163,6 +1185,224 @@ where
     pub remote: R,
 }
 
+/// The root and timestamp updates as the specification describes them: the root is found by
+/// probing for each successive version, and the timestamp is downloaded afterwards.
+#[cfg(not(feature = "timestamp-root-version"))]
+impl<D, L, R> Client<D, L, R>
+where
+    D: Pouf,
+    L: RepositoryProvider<D> + RepositoryStorage<D>,
+    R: RepositoryProvider<D>,
+{
+    /// Update the root metadata and then the timestamp metadata.
+    ///
+    /// Returns whether the root and the timestamp were updated, respectively.
+    async fn update_root_and_timestamp_with_repos<Remote>(
+        start_time: &DateTime<Utc>,
+        config: &Config,
+        tuf: &mut Database<D>,
+        mut local: Option<&mut Repository<L, D>>,
+        remote: &Repository<Remote, D>,
+    ) -> Result<(bool, bool)>
+    where
+        Remote: RepositoryProvider<D>,
+    {
+        let root_updated =
+            Self::update_root_with_repos(start_time, config, tuf, local.as_deref_mut(), remote)
+                .await?;
+        let timestamp_updated =
+            Self::update_timestamp_with_repos(start_time, config, tuf, local, remote).await?;
+
+        Ok((root_updated, timestamp_updated))
+    }
+
+    async fn update_timestamp_with_repos<Remote>(
+        start_time: &DateTime<Utc>,
+        config: &Config,
+        tuf: &mut Database<D>,
+        local: Option<&mut Repository<L, D>>,
+        remote: &Repository<Remote, D>,
+    ) -> Result<bool>
+    where
+        Remote: RepositoryProvider<D>,
+    {
+        let timestamp_path = MetadataPath::timestamp();
+
+        /////////////////////////////////////////
+        // TUF-1.0.9 §5.2:
+        //
+        //     Download the timestamp metadata file, up to X number of bytes (because the size is
+        //     unknown). The value for X is set by the authors of the application using TUF. For
+        //     example, X may be tens of kilobytes. The filename used to download the timestamp
+        //     metadata file is of the fixed form FILENAME.EXT (e.g., timestamp.json).
+
+        let raw_signed_timestamp = remote
+            .fetch_metadata(
+                &timestamp_path,
+                MetadataVersion::None,
+                config.max_timestamp_length,
+                vec![],
+            )
+            .await?;
+
+        Self::update_timestamp_from_raw(start_time, tuf, local, &raw_signed_timestamp).await
+    }
+}
+
+/// The root and timestamp updates with the `timestamp-root-version` feature, which deviates from the
+/// specification: the timestamp is downloaded first and names the latest root version, so the
+/// root update fetches exactly the versions it needs instead of probing for them.
+#[cfg(feature = "timestamp-root-version")]
+impl<D, L, R> Client<D, L, R>
+where
+    D: Pouf,
+    L: RepositoryProvider<D> + RepositoryStorage<D>,
+    R: RepositoryProvider<D>,
+{
+    /// Update the root and timestamp metadata together, downloading the remote timestamp only
+    /// once: it first serves as the root version hint and is then verified as the new timestamp.
+    ///
+    /// Returns whether the root and the timestamp were updated, respectively.
+    async fn update_root_and_timestamp_with_repos<Remote>(
+        start_time: &DateTime<Utc>,
+        config: &Config,
+        tuf: &mut Database<D>,
+        mut local: Option<&mut Repository<L, D>>,
+        remote: &Repository<Remote, D>,
+    ) -> Result<(bool, bool)>
+    where
+        Remote: RepositoryProvider<D>,
+    {
+        let timestamp = Self::fetch_timestamp(config, remote).await?;
+
+        let root_updated = Self::update_root_with_hint(
+            config,
+            tuf,
+            local.as_deref_mut(),
+            remote,
+            timestamp.as_ref(),
+        )
+        .await?;
+        Self::check_root_expiration(start_time, tuf)?;
+
+        let timestamp = timestamp.ok_or_else(|| Error::MetadataNotFound {
+            path: MetadataPath::timestamp(),
+            version: MetadataVersion::None,
+        })?;
+        let timestamp_updated =
+            Self::update_timestamp_from_raw(start_time, tuf, local, &timestamp).await?;
+
+        Ok((root_updated, timestamp_updated))
+    }
+
+    /// Fetch the remote timestamp, or `None` if the remote does not have one.
+    async fn fetch_timestamp<Remote>(
+        config: &Config,
+        remote: &Repository<Remote, D>,
+    ) -> Result<Option<RawSignedMetadata<D, TimestampMetadata>>>
+    where
+        Remote: RepositoryProvider<D>,
+    {
+        match remote
+            .fetch_metadata(
+                &MetadataPath::timestamp(),
+                MetadataVersion::None,
+                config.max_timestamp_length,
+                vec![],
+            )
+            .await
+        {
+            Ok(raw_timestamp) => Ok(Some(raw_timestamp)),
+            Err(Error::MetadataNotFound { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Update the root metadata, using the root version published in `timestamp` when there is
+    /// one and probing for each version otherwise.
+    ///
+    /// Returns `true` if an update occurred and `false` otherwise.
+    async fn update_root_with_hint<Remote>(
+        config: &Config,
+        tuf: &mut Database<D>,
+        mut local: Option<&mut Repository<L, D>>,
+        remote: &Repository<Remote, D>,
+        timestamp: Option<&RawSignedMetadata<D, TimestampMetadata>>,
+    ) -> Result<bool>
+    where
+        Remote: RepositoryProvider<D>,
+    {
+        let hinted = match timestamp {
+            Some(timestamp) => {
+                Self::update_root_from_timestamp(
+                    config,
+                    tuf,
+                    local.as_deref_mut(),
+                    remote,
+                    timestamp,
+                )
+                .await?
+            }
+            None => None,
+        };
+        match hinted {
+            Some(updated) => Ok(updated),
+            None => Self::update_root_sequentially(config, tuf, local, remote).await,
+        }
+    }
+
+    /// Update the root metadata using the root version the remote timestamp publishes, instead of
+    /// probing for one version at a time. This deviates from the specification.
+    ///
+    /// The timestamp is read here without verification, purely as a hint: the root update it
+    /// points at may rotate the timestamp keys, so it can only be verified afterwards (which
+    /// `update_timestamp_from_raw` does). The hint cannot weaken the update, because every root it
+    /// leads to still has to form a valid signed chain from the trusted root. A bad hint can only
+    /// make the update fail or fetch nothing.
+    ///
+    /// Returns `None` when the timestamp does not publish a root version, so the caller can fall
+    /// back to sequential probing. Fails if the published version is older than the trusted root.
+    async fn update_root_from_timestamp<Remote>(
+        config: &Config,
+        tuf: &mut Database<D>,
+        mut local: Option<&mut Repository<L, D>>,
+        remote: &Repository<Remote, D>,
+        raw_timestamp: &RawSignedMetadata<D, TimestampMetadata>,
+    ) -> Result<Option<bool>>
+    where
+        Remote: RepositoryProvider<D>,
+    {
+        let latest_version = match raw_timestamp.parse_untrusted()?.assume_valid()?.root() {
+            Some(root) => root.version(),
+            None => return Ok(None),
+        };
+
+        let trusted_version = tuf.trusted_root().version();
+        if latest_version < trusted_version {
+            return Err(Error::AttemptedMetadataRollBack {
+                role: MetadataPath::root(),
+                trusted_version,
+                new_version: latest_version,
+            });
+        }
+
+        // Install every root newer than the trusted one, oldest first, so each is verified against
+        // the chain before the next is downloaded.
+        for version in trusted_version + 1..=latest_version {
+            Self::install_root(
+                config,
+                tuf,
+                local.as_deref_mut(),
+                remote,
+                MetadataVersion::Number(version),
+            )
+            .await?;
+        }
+
+        Ok(Some(latest_version > trusted_version))
+    }
+}
+
 /// Helper function that first tries to fetch the metadata from the local store, and if it doesn't
 /// exist or does and fails to parse, try fetching it from the remote store.
 async fn fetch_metadata_from_local_or_else_remote<'a, D, L, R, M>(
@@ -1524,6 +1764,16 @@ mod test {
         // fetched since it has expired.
         //
         // [1]: https://theupdateframework.github.io/specification/latest/#update-root
+        //
+        // Walking the local root chain probes for the next root version. With the timestamp root
+        // hint, the local timestamp is read instead and, since it names the trusted root version,
+        // no root is fetched.
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let root_walk = || Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2));
+        #[cfg(feature = "timestamp-root-version")]
+        let root_walk =
+            || Track::fetch_meta_found(MetadataVersion::None, metadata1.timestamp().unwrap());
+
         match constructor_mode {
             ConstructorMode::WithTrustedLocal => {
                 assert_eq!(
@@ -1533,18 +1783,12 @@ mod test {
                             MetadataVersion::Number(1),
                             metadata1.root().unwrap()
                         ),
-                        Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2)),
+                        root_walk(),
                     ],
                 );
             }
             ConstructorMode::WithTrustedRoot => {
-                assert_eq!(
-                    client.local_repo().take_tracks(),
-                    vec![Track::FetchErr(
-                        MetadataPath::root(),
-                        MetadataVersion::Number(2)
-                    )],
-                );
+                assert_eq!(client.local_repo().take_tracks(), vec![root_walk()]);
             }
             ConstructorMode::WithTrustedRootKeys => {
                 assert_eq!(
@@ -1554,7 +1798,7 @@ mod test {
                             MetadataVersion::Number(1),
                             metadata1.root().unwrap()
                         ),
-                        Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2)),
+                        root_walk(),
                     ],
                 );
             }
@@ -1568,16 +1812,24 @@ mod test {
 
         // We should only fetch metadata from the remote repository and write it to the local
         // repository.
-        assert_eq!(
-            client.remote_repo().take_tracks(),
-            vec![
-                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
-                Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3)),
-                Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
-                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.snapshot().unwrap()),
-                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.targets().unwrap()),
-            ],
-        );
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let root_and_timestamp = vec![
+            Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+            Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3)),
+            Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
+        ];
+        // The timestamp is fetched once, as the root hint, and then verified as the timestamp.
+        #[cfg(feature = "timestamp-root-version")]
+        let root_and_timestamp = vec![
+            Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
+            Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+        ];
+        let mut expected = root_and_timestamp;
+        expected.extend([
+            Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.snapshot().unwrap()),
+            Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.targets().unwrap()),
+        ]);
+        assert_eq!(client.remote_repo().take_tracks(), expected);
         assert_eq!(
             client.local_repo().take_tracks(),
             vec![
@@ -1594,13 +1846,17 @@ mod test {
         assert_eq!(client.tuf.trusted_root().version(), 2);
 
         // Make sure we only fetched the next root and timestamp, and didn't store anything.
-        assert_eq!(
-            client.remote_repo().take_tracks(),
-            vec![
-                Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3)),
-                Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
-            ]
-        );
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let expected = vec![
+            Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3)),
+            Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
+        ];
+        #[cfg(feature = "timestamp-root-version")]
+        let expected = vec![Track::fetch_meta_found(
+            MetadataVersion::None,
+            metadata2.timestamp().unwrap(),
+        )];
+        assert_eq!(client.remote_repo().take_tracks(), expected);
         assert_eq!(client.local_repo().take_tracks(), vec![]);
     }
 
@@ -1645,13 +1901,19 @@ mod test {
 
             // We should have tried fetching a new timestamp, but it shouldn't exist in the
             // repository.
-            assert_eq!(
-                client.local_repo().take_tracks(),
-                vec![
-                    Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2)),
-                    Track::FetchErr(MetadataPath::timestamp(), MetadataVersion::None)
-                ],
-            );
+            #[cfg(not(feature = "timestamp-root-version"))]
+            let expected = vec![
+                Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2)),
+                Track::FetchErr(MetadataPath::timestamp(), MetadataVersion::None),
+            ];
+            // The timestamp is fetched once, as the root hint; its absence then fails the
+            // timestamp update without another fetch.
+            #[cfg(feature = "timestamp-root-version")]
+            let expected = vec![
+                Track::FetchErr(MetadataPath::timestamp(), MetadataVersion::None),
+                Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2)),
+            ];
+            assert_eq!(client.local_repo().take_tracks(), expected);
 
             // An update should succeed.
             let mut parts = client.into_parts();
@@ -1677,22 +1939,23 @@ mod test {
             assert_eq!(client.tuf.trusted_root().version(), 2);
 
             // We should have fetched the metadata, and written it to the local database.
-            assert_eq!(
-                client.remote_repo().take_tracks(),
-                vec![
-                    Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
-                    Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3)),
-                    Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
-                    Track::fetch_meta_found(
-                        MetadataVersion::Number(2),
-                        metadata2.snapshot().unwrap()
-                    ),
-                    Track::fetch_meta_found(
-                        MetadataVersion::Number(2),
-                        metadata2.targets().unwrap()
-                    ),
-                ],
-            );
+            #[cfg(not(feature = "timestamp-root-version"))]
+            let root_and_timestamp = vec![
+                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+                Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3)),
+                Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
+            ];
+            #[cfg(feature = "timestamp-root-version")]
+            let root_and_timestamp = vec![
+                Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
+                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+            ];
+            let mut expected = root_and_timestamp;
+            expected.extend([
+                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.snapshot().unwrap()),
+                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.targets().unwrap()),
+            ]);
+            assert_eq!(client.remote_repo().take_tracks(), expected);
             assert_eq!(
                 client.local_repo().take_tracks(),
                 vec![
@@ -1763,13 +2026,17 @@ mod test {
 
             // We should only load the root metadata, but because it's expired we don't try
             // fetching the other local metadata.
-            assert_eq!(
-                client.local_repo().take_tracks(),
-                vec![
-                    Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
-                    Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3))
-                ],
-            );
+            #[cfg(not(feature = "timestamp-root-version"))]
+            let expected = vec![
+                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+                Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(3)),
+            ];
+            #[cfg(feature = "timestamp-root-version")]
+            let expected = vec![
+                Track::fetch_meta_found(MetadataVersion::None, metadata2.timestamp().unwrap()),
+                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+            ];
+            assert_eq!(client.local_repo().take_tracks(), expected);
 
             // An update should succeed.
             let mut parts = client.into_parts();
@@ -1847,17 +2114,20 @@ mod test {
 
             // We should only load the root metadata, but because it's expired we don't try
             // fetching the other local metadata.
-            assert_eq!(
-                client.local_repo().take_tracks(),
-                vec![
-                    Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2)),
-                    Track::FetchFound {
-                        path: MetadataPath::timestamp(),
-                        version: MetadataVersion::None,
-                        metadata: junk_timestamp.into(),
-                    },
-                ],
-            );
+            let junk = Track::FetchFound {
+                path: MetadataPath::timestamp(),
+                version: MetadataVersion::None,
+                metadata: junk_timestamp.into(),
+            };
+            #[cfg(not(feature = "timestamp-root-version"))]
+            let expected = vec![
+                Track::FetchErr(MetadataPath::root(), MetadataVersion::Number(2)),
+                junk,
+            ];
+            // The root hint reads the timestamp first and gives up on the malformed one.
+            #[cfg(feature = "timestamp-root-version")]
+            let expected = vec![junk];
+            assert_eq!(client.local_repo().take_tracks(), expected);
 
             // An update should work.
             assert_matches!(client.update().await, Ok(true));
@@ -1926,29 +2196,51 @@ mod test {
                 metadata1.root().unwrap().as_bytes()
             ),]
         );
-        assert_eq!(
-            client.local_repo().take_tracks(),
-            vec![
-                Track::FetchErr(root_path.clone(), MetadataVersion::Number(1)),
-                Track::store_meta(MetadataVersion::Number(1), metadata1.root().unwrap()),
-                Track::FetchErr(root_path.clone(), MetadataVersion::Number(2)),
-                Track::FetchErr(timestamp_path.clone(), MetadataVersion::None),
-            ]
-        );
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let root_and_timestamp = vec![
+            Track::FetchErr(root_path.clone(), MetadataVersion::Number(2)),
+            Track::FetchErr(timestamp_path.clone(), MetadataVersion::None),
+        ];
+        // The (missing) timestamp is fetched once, as the root hint, before falling back to
+        // probing.
+        #[cfg(feature = "timestamp-root-version")]
+        let root_and_timestamp = vec![
+            Track::FetchErr(timestamp_path.clone(), MetadataVersion::None),
+            Track::FetchErr(root_path.clone(), MetadataVersion::Number(2)),
+        ];
+        let mut expected = vec![
+            Track::FetchErr(root_path.clone(), MetadataVersion::Number(1)),
+            Track::store_meta(MetadataVersion::Number(1), metadata1.root().unwrap()),
+        ];
+        expected.extend(root_and_timestamp);
+        assert_eq!(client.local_repo().take_tracks(), expected);
 
         assert_matches!(client.update().await, Ok(true));
         assert_eq!(client.tuf.trusted_root().version(), 1);
 
-        // Make sure we fetched the metadata in the right order.
-        assert_eq!(
-            client.remote_repo().take_tracks(),
+        // Make sure we fetched the metadata in the right order. Probing for the next root fails;
+        // the root hint reads the timestamp instead, which names the trusted root version and is
+        // then verified as the timestamp without being fetched again.
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let root_and_timestamp = || {
             vec![
                 Track::FetchErr(root_path.clone(), MetadataVersion::Number(2)),
                 Track::fetch_meta_found(MetadataVersion::None, metadata1.timestamp().unwrap()),
-                Track::fetch_meta_found(snapshot_version, metadata1.snapshot().unwrap()),
-                Track::fetch_meta_found(targets_version, metadata1.targets().unwrap()),
             ]
-        );
+        };
+        #[cfg(feature = "timestamp-root-version")]
+        let root_and_timestamp = || {
+            vec![Track::fetch_meta_found(
+                MetadataVersion::None,
+                metadata1.timestamp().unwrap(),
+            )]
+        };
+        let mut expected = root_and_timestamp();
+        expected.extend([
+            Track::fetch_meta_found(snapshot_version, metadata1.snapshot().unwrap()),
+            Track::fetch_meta_found(targets_version, metadata1.targets().unwrap()),
+        ]);
+        assert_eq!(client.remote_repo().take_tracks(), expected);
         assert_eq!(
             client.local_repo().take_tracks(),
             vec![
@@ -1963,13 +2255,7 @@ mod test {
         assert_eq!(client.tuf.trusted_root().version(), 1);
 
         // Make sure we only fetched the next root and timestamp, and didn't store anything.
-        assert_eq!(
-            client.remote_repo().take_tracks(),
-            vec![
-                Track::FetchErr(root_path.clone(), MetadataVersion::Number(2)),
-                Track::fetch_meta_found(MetadataVersion::None, metadata1.timestamp().unwrap()),
-            ]
-        );
+        assert_eq!(client.remote_repo().take_tracks(), root_and_timestamp());
         assert_eq!(client.local_repo().take_tracks(), vec![]);
 
         ////
@@ -2011,6 +2297,31 @@ mod test {
             .await
             .unwrap();
 
+        // A repository publishing the root hint has to republish the timestamp whenever the root
+        // changes, otherwise clients never learn about the new root. Re-sign the version 1
+        // snapshot with the version 3 timestamp key, naming root version 3.
+        #[cfg(feature = "timestamp-root-version")]
+        let timestamp = {
+            let snapshot = metadata1.snapshot().unwrap().parse_untrusted().unwrap();
+            let raw = TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(2)
+                .root_version(3)
+                .signed::<Pouf1>(&KEYS[2])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+            parts
+                .remote
+                .as_inner_mut()
+                .store_metadata(&timestamp_path, MetadataVersion::None, &mut raw.as_bytes())
+                .await
+                .unwrap();
+            raw
+        };
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let timestamp = metadata1.timestamp().unwrap().clone();
+
         ////
         // Finally, check that the update brings us to version 3.
         let mut client = Client::from_parts(parts);
@@ -2020,17 +2331,27 @@ mod test {
         // Make sure we fetched and stored the metadata in the expected order. Note that we
         // re-fetch snapshot and targets because we rotated keys, which caused `tuf::Database` to delete
         // the metadata.
-        assert_eq!(
-            client.remote_repo().take_tracks(),
-            vec![
-                Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
-                Track::fetch_meta_found(MetadataVersion::Number(3), metadata3.root().unwrap()),
-                Track::FetchErr(root_path.clone(), MetadataVersion::Number(4)),
-                Track::fetch_meta_found(MetadataVersion::None, metadata1.timestamp().unwrap()),
-                Track::fetch_meta_found(snapshot_version, metadata1.snapshot().unwrap()),
-                Track::fetch_meta_found(targets_version, metadata1.targets().unwrap()),
-            ]
-        );
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let root_and_timestamp = vec![
+            Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+            Track::fetch_meta_found(MetadataVersion::Number(3), metadata3.root().unwrap()),
+            Track::FetchErr(root_path.clone(), MetadataVersion::Number(4)),
+            Track::fetch_meta_found(MetadataVersion::None, &timestamp),
+        ];
+        // With the root hint only the roots the timestamp names are fetched, with no trailing
+        // probe, and the timestamp is only fetched once.
+        #[cfg(feature = "timestamp-root-version")]
+        let root_and_timestamp = vec![
+            Track::fetch_meta_found(MetadataVersion::None, &timestamp),
+            Track::fetch_meta_found(MetadataVersion::Number(2), metadata2.root().unwrap()),
+            Track::fetch_meta_found(MetadataVersion::Number(3), metadata3.root().unwrap()),
+        ];
+        let mut expected = root_and_timestamp;
+        expected.extend([
+            Track::fetch_meta_found(snapshot_version, metadata1.snapshot().unwrap()),
+            Track::fetch_meta_found(targets_version, metadata1.targets().unwrap()),
+        ]);
+        assert_eq!(client.remote_repo().take_tracks(), expected);
         assert_eq!(
             client.local_repo().take_tracks(),
             vec![
@@ -2038,11 +2359,61 @@ mod test {
                 Track::store_meta(MetadataVersion::Number(2), metadata2.root().unwrap()),
                 Track::store_meta(MetadataVersion::None, metadata3.root().unwrap()),
                 Track::store_meta(MetadataVersion::Number(3), metadata3.root().unwrap()),
-                Track::store_meta(MetadataVersion::None, metadata1.timestamp().unwrap()),
+                Track::store_meta(MetadataVersion::None, &timestamp),
                 Track::store_meta(MetadataVersion::None, metadata1.snapshot().unwrap()),
                 Track::store_meta(MetadataVersion::None, metadata1.targets().unwrap()),
             ],
         );
+    }
+
+    /// The root hint must never move the client to an older root than it already trusts.
+    #[cfg(feature = "timestamp-root-version")]
+    #[test]
+    fn root_hint_older_than_trusted_root_is_rejected() {
+        block_on(async {
+            // The remote only has root version 1, and its timestamp says so.
+            let mut remote = EphemeralRepository::<Pouf1>::new();
+            let _metadata1 = RepoBuilder::create(&mut remote)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .stage_root()
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+
+            // But the client already trusts root version 2.
+            let mut scratch = EphemeralRepository::<Pouf1>::new();
+            let metadata2 = RepoBuilder::create(&mut scratch)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .stage_root_with_builder(|bld| bld.version(2))
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+
+            let mut client = Client::from_database(
+                Config::default(),
+                Database::from_trusted_root(metadata2.root().unwrap()).unwrap(),
+                EphemeralRepository::<Pouf1>::new(),
+                remote,
+            );
+
+            assert_matches!(
+                client.update().await,
+                Err(Error::AttemptedMetadataRollBack {
+                    role,
+                    trusted_version: 2,
+                    new_version: 1,
+                }) if role == MetadataPath::root()
+            );
+            assert_eq!(client.tuf.trusted_root().version(), 2);
+        })
     }
 
     #[test]

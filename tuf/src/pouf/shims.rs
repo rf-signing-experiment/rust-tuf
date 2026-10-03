@@ -242,6 +242,52 @@ pub struct TimestampMetadata {
 struct TimestampMeta {
     #[serde(rename = "snapshot.json")]
     snapshot: metadata::MetadataDescription<metadata::SnapshotMetadata>,
+    #[cfg(feature = "timestamp-root-version")]
+    #[serde(rename = "root.json", default, skip_serializing_if = "Option::is_none")]
+    root: Option<metadata::MetadataDescription<metadata::RootMetadata>>,
+}
+
+#[cfg(not(feature = "timestamp-root-version"))]
+impl TimestampMeta {
+    fn from(metadata: &metadata::TimestampMetadata) -> Self {
+        TimestampMeta {
+            snapshot: metadata.snapshot().clone(),
+        }
+    }
+
+    fn into_metadata(
+        self,
+        version: u32,
+        expires: DateTime<Utc>,
+        additional_fields: HashMap<String, serde_json::Value>,
+    ) -> Result<metadata::TimestampMetadata> {
+        metadata::TimestampMetadata::new(version, expires, self.snapshot, additional_fields)
+    }
+}
+
+#[cfg(feature = "timestamp-root-version")]
+impl TimestampMeta {
+    fn from(metadata: &metadata::TimestampMetadata) -> Self {
+        TimestampMeta {
+            snapshot: metadata.snapshot().clone(),
+            root: metadata.root().cloned(),
+        }
+    }
+
+    fn into_metadata(
+        self,
+        version: u32,
+        expires: DateTime<Utc>,
+        additional_fields: HashMap<String, serde_json::Value>,
+    ) -> Result<metadata::TimestampMetadata> {
+        metadata::TimestampMetadata::with_root(
+            version,
+            expires,
+            self.snapshot,
+            self.root,
+            additional_fields,
+        )
+    }
 }
 
 impl TimestampMetadata {
@@ -251,9 +297,7 @@ impl TimestampMetadata {
             spec_version: SPEC_VERSION.to_string(),
             version: metadata.version(),
             expires: format_datetime(metadata.expires()),
-            meta: TimestampMeta {
-                snapshot: metadata.snapshot().clone(),
-            },
+            meta: TimestampMeta::from(metadata),
             additional_fields: metadata.additional_fields().clone().into_iter().collect(),
         })
     }
@@ -273,10 +317,9 @@ impl TimestampMetadata {
             )));
         }
 
-        metadata::TimestampMetadata::new(
+        self.meta.into_metadata(
             self.version,
             parse_datetime(&self.expires)?,
-            self.meta.snapshot,
             self.additional_fields.into_iter().collect(),
         )
     }

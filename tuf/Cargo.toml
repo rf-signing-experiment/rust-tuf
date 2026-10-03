@@ -48,3 +48,6 @@ http = "1"
 maplit = "1"
 pretty_assertions = "1"
 
+
+[features]
+timestamp-root-version = []

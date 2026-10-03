@@ -1087,6 +1087,8 @@ pub struct TimestampMetadataBuilder {
     version: u32,
     expires: DateTime<Utc>,
     snapshot: MetadataDescription<SnapshotMetadata>,
+    #[cfg(feature = "timestamp-root-version")]
+    root_version: Option<u32>,
 }
 
 impl TimestampMetadataBuilder {
@@ -1121,6 +1123,8 @@ impl TimestampMetadataBuilder {
             version: 1,
             expires: Utc::now() + Duration::days(1),
             snapshot: description,
+            #[cfg(feature = "timestamp-root-version")]
+            root_version: None,
         }
     }
 
@@ -1136,16 +1140,6 @@ impl TimestampMetadataBuilder {
         self
     }
 
-    /// Construct a new `TimestampMetadata`.
-    pub fn build(self) -> Result<TimestampMetadata> {
-        TimestampMetadata::new(
-            self.version,
-            self.expires,
-            self.snapshot,
-            Default::default(),
-        )
-    }
-
     /// Construct a new `SignedMetadata<D, TimestampMetadata>`.
     pub fn signed<D>(
         self,
@@ -1158,15 +1152,67 @@ impl TimestampMetadataBuilder {
     }
 }
 
+#[cfg(not(feature = "timestamp-root-version"))]
+impl TimestampMetadataBuilder {
+    /// Construct a new `TimestampMetadata`.
+    pub fn build(self) -> Result<TimestampMetadata> {
+        TimestampMetadata::new(
+            self.version,
+            self.expires,
+            self.snapshot,
+            Default::default(),
+        )
+    }
+}
+
+#[cfg(feature = "timestamp-root-version")]
+impl TimestampMetadataBuilder {
+    /// Publish the version of the latest root metadata in the timestamp, so clients can fetch
+    /// root updates directly instead of probing for them one version at a time.
+    pub fn root_version(mut self, version: u32) -> Self {
+        self.root_version = Some(version);
+        self
+    }
+
+    /// Construct a new `TimestampMetadata`, publishing the latest root version if one was set.
+    pub fn build(self) -> Result<TimestampMetadata> {
+        TimestampMetadata::with_root(
+            self.version,
+            self.expires,
+            self.snapshot,
+            self.root_version
+                .map(|version| MetadataDescription::new(version, None, HashMap::new()))
+                .transpose()?,
+            Default::default(),
+        )
+    }
+}
+
 /// Metadata for the timestamp role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimestampMetadata {
     version: u32,
     expires: DateTime<Utc>,
     snapshot: MetadataDescription<SnapshotMetadata>,
+    /// The latest root metadata, if the repository publishes it (`meta["root.json"]`).
+    #[cfg(feature = "timestamp-root-version")]
+    root: Option<MetadataDescription<RootMetadata>>,
     additional_fields: HashMap<String, serde_json::Value>,
 }
 
+impl TimestampMetadata {
+    /// An immutable reference to the snapshot description.
+    pub fn snapshot(&self) -> &MetadataDescription<SnapshotMetadata> {
+        &self.snapshot
+    }
+
+    /// An immutable reference to any additional fields on the metadata.
+    pub fn additional_fields(&self) -> &HashMap<String, serde_json::Value> {
+        &self.additional_fields
+    }
+}
+
+#[cfg(not(feature = "timestamp-root-version"))]
 impl TimestampMetadata {
     /// Create new `TimestampMetadata`.
     pub fn new(
@@ -1188,15 +1234,46 @@ impl TimestampMetadata {
             additional_fields,
         })
     }
+}
 
-    /// An immutable reference to the snapshot description.
-    pub fn snapshot(&self) -> &MetadataDescription<SnapshotMetadata> {
-        &self.snapshot
+#[cfg(feature = "timestamp-root-version")]
+impl TimestampMetadata {
+    /// Create new `TimestampMetadata`.
+    pub fn new(
+        version: u32,
+        expires: DateTime<Utc>,
+        snapshot: MetadataDescription<SnapshotMetadata>,
+        additional_fields: HashMap<String, serde_json::Value>,
+    ) -> Result<Self> {
+        Self::with_root(version, expires, snapshot, None, additional_fields)
     }
 
-    /// An immutable reference to any additional fields on the metadata.
-    pub fn additional_fields(&self) -> &HashMap<String, serde_json::Value> {
-        &self.additional_fields
+    /// Create new `TimestampMetadata` that also describes the latest root metadata.
+    pub fn with_root(
+        version: u32,
+        expires: DateTime<Utc>,
+        snapshot: MetadataDescription<SnapshotMetadata>,
+        root: Option<MetadataDescription<RootMetadata>>,
+        additional_fields: HashMap<String, serde_json::Value>,
+    ) -> Result<Self> {
+        if version < 1 {
+            return Err(Error::MetadataVersionMustBeGreaterThanZero(
+                MetadataPath::timestamp(),
+            ));
+        }
+
+        Ok(TimestampMetadata {
+            version,
+            expires,
+            snapshot,
+            root,
+            additional_fields,
+        })
+    }
+
+    /// The description of the latest root metadata, if the repository publishes it.
+    pub fn root(&self) -> Option<&MetadataDescription<RootMetadata>> {
+        self.root.as_ref()
     }
 }
 
@@ -3270,10 +3347,14 @@ mod test {
             }
         });
 
+        #[cfg(not(feature = "timestamp-root-version"))]
+        let expected = "unknown field `targets.json`, expected `snapshot.json`";
+        #[cfg(feature = "timestamp-root-version")]
+        let expected = "unknown field `targets.json`, expected `snapshot.json` or `root.json`";
+
         assert_matches!(
             serde_json::from_value::<TimestampMetadata>(jsn),
-            Err(ref err) if err.to_string() ==
-            "unknown field `targets.json`, expected `snapshot.json`"
+            Err(ref err) if err.to_string() == expected
         );
     }
 
