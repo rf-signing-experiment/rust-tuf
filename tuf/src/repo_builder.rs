@@ -2612,7 +2612,7 @@ mod tests {
 
             let delegation1 = Delegation::builder(delegation_path.clone())
                 .key(delegation_key.public())
-                .delegate_path(TargetPath::new("delegations/").unwrap())
+                .delegate_path(TargetPath::new("delegations/*").unwrap())
                 .build()
                 .unwrap();
 
@@ -2670,7 +2670,7 @@ mod tests {
 
             let delegation2 = Delegation::builder(delegation_path.clone())
                 .key(delegation_key.public())
-                .delegate_path(TargetPath::new("delegations/").unwrap())
+                .delegate_path(TargetPath::new("delegations/*").unwrap())
                 .build()
                 .unwrap();
 

@@ -66,7 +66,6 @@ static PATH_ILLEGAL_STRINGS: &[&str] = &[
     ">",
     "\"",
     "|",
-    "?",
     // control characters, all illegal in FAT
     "\u{000}",
     "\u{001}",
@@ -143,6 +142,42 @@ fn safe_path(path: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Match a single path component against a shell-style pattern, where `*` matches any sequence
+/// of characters and `?` matches any single character.
+fn wildcard_match(pattern: &str, component: &str) -> bool {
+    // Byte offsets into `pattern` and `component`. Both only ever advance by whole characters, so
+    // `?` consumes one character rather than one byte and no intermediate `Vec<char>` is needed.
+    let (mut p, mut c) = (0, 0);
+    // Where to resume when the characters after the most recent `*` fail to match, so the `*`
+    // can absorb one more character of the component. Each retry advances the component by one
+    // character, which bounds the whole match at O(pattern * component).
+    let mut backtrack = None;
+
+    while let Some(ch) = component[c..].chars().next() {
+        match pattern[p..].chars().next() {
+            Some('*') => {
+                backtrack = Some((p, c));
+                p += 1;
+            }
+            Some(pc) if pc == '?' || pc == ch => {
+                p += pc.len_utf8();
+                c += ch.len_utf8();
+            }
+            _ => match backtrack {
+                Some((star_p, star_c)) => {
+                    let absorbed = component[star_c..].chars().next().map_or(0, char::len_utf8);
+                    backtrack = Some((star_p, star_c + absorbed));
+                    p = star_p + 1;
+                    c = star_c + absorbed;
+                }
+                None => return false,
+            },
+        }
+    }
+
+    pattern[p..].chars().all(|ch| ch == '*')
 }
 
 /// The TUF role.
@@ -1564,60 +1599,59 @@ impl TargetPath {
         self.0.split('/').map(|s| s.to_string()).collect()
     }
 
-    /// Return whether this path is the child of another path.
+    /// Return whether this path matches a delegation path pattern.
+    ///
+    /// A pattern follows the Unix shell convention: `*` matches any sequence of characters and
+    /// `?` matches any single character. Neither matches a path separator, so a pattern matches
+    /// a path with the same number of components, component by component.
     ///
     /// ```
     /// # use tuf::metadata::TargetPath;
-    /// let path1 = TargetPath::new("foo").unwrap();
-    /// let path2 = TargetPath::new("foo/bar").unwrap();
-    /// assert!(!path2.is_child(&path1));
+    /// let pattern = TargetPath::new("targets/*.tgz").unwrap();
+    /// assert!(TargetPath::new("targets/foo.tgz").unwrap().matches(&pattern));
+    /// assert!(!TargetPath::new("targets/foo.txt").unwrap().matches(&pattern));
+    /// assert!(!TargetPath::new("targets/sub/foo.tgz").unwrap().matches(&pattern));
     ///
-    /// let path1 = TargetPath::new("foo/").unwrap();
-    /// let path2 = TargetPath::new("foo/bar").unwrap();
-    /// assert!(path2.is_child(&path1));
+    /// let pattern = TargetPath::new("foo-version-?.tgz").unwrap();
+    /// assert!(TargetPath::new("foo-version-2.tgz").unwrap().matches(&pattern));
+    /// assert!(!TargetPath::new("foo-version-alpha.tgz").unwrap().matches(&pattern));
     ///
-    /// let path2 = TargetPath::new("foo/bar/baz").unwrap();
-    /// assert!(path2.is_child(&path1));
+    /// let pattern = TargetPath::new("*.tgz").unwrap();
+    /// assert!(TargetPath::new("foo.tgz").unwrap().matches(&pattern));
+    /// assert!(!TargetPath::new("targets/foo.tgz").unwrap().matches(&pattern));
     ///
-    /// let path2 = TargetPath::new("wat").unwrap();
-    /// assert!(!path2.is_child(&path1))
+    /// let pattern = TargetPath::new("foo.tgz").unwrap();
+    /// assert!(TargetPath::new("foo.tgz").unwrap().matches(&pattern));
+    /// assert!(!TargetPath::new("bar.tgz").unwrap().matches(&pattern));
     /// ```
-    pub fn is_child(&self, parent: &Self) -> bool {
-        if !parent.0.ends_with('/') {
-            return false;
-        }
+    pub fn matches(&self, pattern: &Self) -> bool {
+        let components = self.components();
+        let patterns = pattern.components();
 
-        self.0.starts_with(&parent.0)
+        components.len() == patterns.len()
+            && components
+                .iter()
+                .zip(&patterns)
+                .all(|(component, pattern)| wildcard_match(pattern, component))
+    }
+
+    /// Return whether this path matches a delegation path pattern.
+    ///
+    /// This is [TargetPath::matches] under its former name. A pattern no longer covers every
+    /// path beneath it: `foo/` only matches `foo/`, and `foo/*` is the pattern that matches
+    /// `foo/bar`.
+    #[deprecated(note = "use `TargetPath::matches`")]
+    pub fn is_child(&self, parent: &Self) -> bool {
+        self.matches(parent)
     }
 
     /// Whether or not the current target is available at the end of the given chain of target
-    /// paths. For the chain to be valid, each target path in a group must be a child of of all
-    /// previous groups.
-    // TODO this is hideous and uses way too much clone/heap but I think recursively,
-    // so here we are
+    /// paths. For the chain to be valid, the target must match a path pattern of every group.
     pub fn matches_chain(&self, parents: &[HashSet<TargetPath>]) -> bool {
-        if parents.is_empty() {
-            return false;
-        }
-        if parents.len() == 1 {
-            return parents[0].iter().any(|p| p == self || self.is_child(p));
-        }
-
-        let new = parents[1..]
-            .iter()
-            .map(|group| {
-                group
-                    .iter()
-                    .filter(|parent| {
-                        parents[0]
-                            .iter()
-                            .any(|p| parent.is_child(p) || parent == &p)
-                    })
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .collect::<Vec<_>>();
-        self.matches_chain(&new)
+        !parents.is_empty()
+            && parents
+                .iter()
+                .all(|group| group.iter().any(|pattern| self.matches(pattern)))
     }
 
     /// Prefix the target path with a hash value to support TUF spec 5.5.2.
@@ -2356,19 +2390,75 @@ mod test {
     }
 
     #[test]
-    fn allow_asterisk_in_target_path() {
+    fn allow_wildcards_in_target_path() {
         let good_paths = &[
             "*",
             "*/some/path",
             "*/some/path/",
             "some/*/path",
             "some/*/path/*",
+            "?",
+            "some/?/path",
+            "some/path-?.tgz",
         ];
 
         for path in good_paths.iter() {
             assert!(safe_path(path).is_ok());
             assert!(TargetPath::new(path.to_string()).is_ok());
             assert!(MetadataPath::new(path.to_string()).is_ok());
+        }
+    }
+
+    #[test]
+    fn path_matches_pattern() {
+        let test_cases: &[(bool, &str, &str)] = &[
+            (true, "foo", "foo"),
+            (false, "foo", "bar"),
+            (false, "foo", "fo"),
+            (false, "fo", "foo"),
+            (true, "foo", "*"),
+            (true, "foo", "f*"),
+            (true, "foo", "*o"),
+            (true, "foo", "f?o"),
+            (false, "foo", "f?"),
+            (false, "foo/bar", "*"),
+            (false, "foo/bar", "foo/"),
+            (true, "foo/bar", "foo/*"),
+            (false, "foo/bar/baz", "foo/*"),
+            (true, "foo/bar/baz", "foo/*/*"),
+            (true, "foo.tar.gz", "*.tar.gz"),
+            (false, "foo.tar.gz", "*.tgz"),
+            (true, "a-b-c", "a*b*c"),
+            (true, "abc", "a*b*c"),
+            (false, "ab", "a*b*c"),
+            (true, "aXbYbZc", "a*b*c"),
+            // `?` consumes one character, not one byte
+            (true, "f\u{f6}o", "f?o"),
+            (false, "f\u{f6}o", "f??o"),
+            (true, "f\u{f6}o", "f*o"),
+            // many stars against a long near-miss: a naive recursive matcher goes exponential here
+            (
+                false,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "*a*a*a*a*a*a*a*a*a*a*b",
+            ),
+            (
+                true,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+                "*a*a*a*a*a*a*a*a*a*a*b",
+            ),
+        ];
+
+        for (expected, path, pattern) in test_cases {
+            let path = TargetPath::new(*path).unwrap();
+            let pattern = TargetPath::new(*pattern).unwrap();
+            assert_eq!(
+                path.matches(&pattern),
+                *expected,
+                "{:?} {:?}",
+                path,
+                pattern
+            );
         }
     }
 
@@ -2384,15 +2474,17 @@ mod test {
             // target not in last position
             (false, "foo", &[&["foo"], &["bar"]]),
             // target nested
-            (true, "foo/bar", &[&["foo/"], &["foo/bar"]]),
+            (true, "foo/bar", &[&["foo/*"], &["foo/bar"]]),
             // target illegally nested
-            (false, "foo/bar", &[&["baz/"], &["foo/bar"]]),
+            (false, "foo/bar", &[&["baz/*"], &["foo/bar"]]),
             // target illegally deeply nested
             (
                 false,
                 "foo/bar/baz",
-                &[&["foo/"], &["foo/quux/"], &["foo/bar/baz"]],
+                &[&["foo/*/*"], &["foo/quux/*"], &["foo/bar/baz"]],
             ),
+            // wildcard chain
+            (true, "foo/bar/baz", &[&["foo/*/*"], &["*/bar/?az"]]),
             // empty
             (false, "foo", &[&[]]),
             // empty 2

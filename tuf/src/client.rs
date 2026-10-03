@@ -1000,11 +1000,15 @@ where
             }
 
             for delegation in targets.delegations().roles() {
-                if !delegation
-                    .paths()
-                    .iter()
-                    .any(|p| target == p || target.is_child(p))
-                {
+                /////////////////////////////////////////
+                // TUF-1.0.29 §4.5:
+                //
+                //     PATHPATTERN supports the Unix shell pattern matching convention for paths
+                //     (globbing pathnames). Its format may either indicate a path to a single
+                //     file, or to multiple files with the use of shell-style wildcards (* or ?).
+                //     [...] A path separator in a path SHOULD NOT be matched by a wildcard in the
+                //     PATHPATTERN.
+                if !delegation.paths().iter().any(|p| target.matches(p)) {
                     continue;
                 }
 
@@ -2164,19 +2168,19 @@ mod test {
     /// Look up `path` in a repository whose top-level targets lists nothing itself, and instead
     /// delegates to these terminating roles in order:
     ///
-    /// * `a`, trusted for `a/`, which lists `a/foo`.
-    /// * `b`, trusted for `b/`, which lists `b/foo`.
-    /// * `c`, trusted for `c/`, which lists nothing.
-    /// * `d`, trusted for `c/`, which lists `c/foo`.
+    /// * `a`, trusted for `a/*`, which lists `a/foo`.
+    /// * `b`, trusted for `b/*`, which lists `b/foo`.
+    /// * `c`, trusted for `c/*`, which lists nothing.
+    /// * `d`, trusted for `c/*`, which lists `c/foo`.
     ///
     /// Each target's contents are its own path.
     async fn fetch_delegated_target_description(path: &str) -> Result<TargetDescription> {
         let delegation_key = &KEYS[1];
         let roles = [
-            ("a", "a/", Some("a/foo")),
-            ("b", "b/", Some("b/foo")),
-            ("c", "c/", None),
-            ("d", "c/", Some("c/foo")),
+            ("a", "a/*", Some("a/foo")),
+            ("b", "b/*", Some("b/foo")),
+            ("c", "c/*", None),
+            ("d", "c/*", Some("c/foo")),
         ];
 
         let mut delegations = Vec::new();
