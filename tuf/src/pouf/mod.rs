@@ -87,7 +87,7 @@ pub struct SignedDocumentOwned<R> {
 /// [`signing_input`]: Pouf::signing_input
 /// [`serialize_signed`]: Pouf::serialize_signed
 /// [`deserialize_signed`]: Pouf::deserialize_signed
-pub trait Pouf: Sized + Sync {
+pub trait Pouf: Sized + Send + Sync {
     /// The type of data that is contained in the `signed` portion of metadata.
     type RawData: PartialEq;
 
