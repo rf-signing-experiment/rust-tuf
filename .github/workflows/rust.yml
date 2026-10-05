@@ -19,27 +19,73 @@ jobs:
           - beta
           - nightly
           - "1.88.0"
+        include:
+          - os: ubuntu-24.04-arm
+            rust: stable
+          - os: macos-15-intel
+            rust: stable
+          - os: windows-11-arm
+            rust: stable
     steps:
       - name: Checkout repository
         uses: actions/checkout@v1
 
       - name: Install Rust
-        uses: actions-rs/toolchain/@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
           toolchain: ${{ matrix.rust }}
-          override: true
 
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
+        run: cargo build --workspace
 
       - name: Run Tests
-        uses: actions-rs/cargo@v1
+        run: cargo test --workspace
+
+  cross:
+    name: cross (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-linux-android
+          - x86_64-pc-windows-gnu
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        run: cross build --workspace --target ${{ matrix.target }}
+
+      - name: Run Tests
+        run: cross test --workspace --target ${{ matrix.target }}
+
+  cross-check:
+    name: check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-pc-windows-gnullvm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          command: test
-          args: ${{ matrix.features }}
+          targets: ${{ matrix.target }}
+
+      - name: Check
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
 
   rustfmt:
     name: rustfmt
