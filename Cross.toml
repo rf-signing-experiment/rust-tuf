@@ -1,0 +1,8 @@
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main"
+
+[target.aarch64-linux-android]
+image = "ghcr.io/cross-rs/aarch64-linux-android:main"
+
+[target.x86_64-pc-windows-gnu]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:main"
