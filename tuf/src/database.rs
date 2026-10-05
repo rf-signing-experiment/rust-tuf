@@ -922,7 +922,6 @@ impl<D: Pouf> Database<D> {
             start_time: &DateTime<Utc>,
             tuf: &'a Database<D>,
             default_terminate: bool,
-            current_depth: u32,
             target_path: &TargetPath,
             delegations: &'a Delegations,
             parents: &[HashSet<TargetPath>],
@@ -937,8 +936,14 @@ impl<D: Pouf> Database<D> {
                 let mut new_parents = parents.to_owned();
                 new_parents.push(delegation.paths().clone());
 
-                if current_depth > 0 && !target_path.matches_chain(parents) {
-                    return (delegation.terminating(), None);
+                /////////////////////////////////////////
+                // TUF-1.0.29 §4.5:
+                //
+                //     Clients MUST check that a target is in one of the trusted paths of all roles
+                //     in a delegation chain, not just in a trusted path of the role that describes
+                //     the target file.
+                if !target_path.matches_chain(&new_parents) {
+                    continue;
                 }
 
                 let trusted_delegation = match tuf.trusted_delegations.get(delegation.name()) {
@@ -958,13 +963,10 @@ impl<D: Pouf> Database<D> {
 
                 // We only need to check the child delegations if it delegates to any child roles.
                 if !trusted_child_delegations.roles().is_empty() {
-                    let mut new_parents = parents.to_vec();
-                    new_parents.push(delegation.paths().clone());
                     let (term, res) = lookup(
                         start_time,
                         tuf,
                         delegation.terminating(),
-                        current_depth + 1,
                         target_path,
                         trusted_child_delegations,
                         &new_parents,
@@ -989,7 +991,6 @@ impl<D: Pouf> Database<D> {
                 start_time,
                 self,
                 false,
-                0,
                 target_path,
                 delegations,
                 &[],
