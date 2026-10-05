@@ -1249,6 +1249,40 @@ where
     }
 }
 
+#[cfg(not(feature = "timestamp-root-version"))]
+impl<'a, D, R> RepoBuilder<'a, D, R, Timestamp<D>>
+where
+    D: Pouf,
+    R: RepositoryStorage<D>,
+{
+    /// Timestamps only publish the latest root version with the `timestamp-root-version` feature.
+    fn publish_root_version(&self, builder: TimestampMetadataBuilder) -> TimestampMetadataBuilder {
+        builder
+    }
+}
+
+#[cfg(feature = "timestamp-root-version")]
+impl<'a, D, R> RepoBuilder<'a, D, R, Timestamp<D>>
+where
+    D: Pouf,
+    R: RepositoryStorage<D>,
+{
+    /// Publish the latest root version in the timestamp so clients can skip probing for root
+    /// updates.
+    fn publish_root_version(&self, builder: TimestampMetadataBuilder) -> TimestampMetadataBuilder {
+        let root_version = self
+            .state
+            .staged_root
+            .as_ref()
+            .map(|root| root.metadata.version())
+            .or_else(|| self.ctx.db.map(|db| db.trusted_root().version()));
+        match root_version {
+            Some(version) => builder.root_version(version),
+            None => builder,
+        }
+    }
+}
+
 impl<'a, D, R> RepoBuilder<'a, D, R, Timestamp<D>>
 where
     D: Pouf,
@@ -1342,6 +1376,8 @@ where
         let timestamp_builder = TimestampMetadataBuilder::from_metadata_description(description)
             .version(next_version)
             .expires(self.ctx.current_time + self.ctx.timestamp_expiration_duration);
+
+        let timestamp_builder = self.publish_root_version(timestamp_builder);
 
         let timestamp = f(timestamp_builder).build()?;
         let raw_timestamp = sign(
@@ -1716,11 +1752,15 @@ mod tests {
             MetadataDescription::new(version, None, HashMap::new()).unwrap()
         };
 
-        let timestamp = TimestampMetadataBuilder::from_metadata_description(description)
+        let builder = TimestampMetadataBuilder::from_metadata_description(description)
             .version(version)
-            .expires(expires)
-            .build()
-            .unwrap();
+            .expires(expires);
+
+        // These tests advance the root and timestamp versions in lockstep.
+        #[cfg(feature = "timestamp-root-version")]
+        let builder = builder.root_version(version);
+
+        let timestamp = builder.build().unwrap();
         SignedMetadataBuilder::<Pouf1, _>::from_metadata(&timestamp)
             .unwrap()
             .sign(&KEYS[3])
